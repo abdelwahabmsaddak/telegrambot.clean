@@ -10,6 +10,6 @@ def ai_analyze(prompt: str) -> str:
         input=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
-        ],
+        ]
     )
     return response.output_text
