@@ -1,4 +1,5 @@
 python-telegram-bot>=21.0
 fastapi
+requests
 uvicorn
 openai>=1.10.0
