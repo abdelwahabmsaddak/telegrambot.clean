@@ -1,5 +1,3 @@
 python-telegram-bot==21.6
-fastapi
 requests
-uvicorn
 openai>=1.10.0
