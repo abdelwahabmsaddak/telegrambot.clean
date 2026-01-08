@@ -8,8 +8,12 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 app = FastAPI()
 tg_app = Application.builder().token(TOKEN).build()
 
+@app.on_event("startup")
+async def startup():
+    await tg_app.initialize()
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ البوت يخدم توّا")
+    await update.message.reply_text("✅ البوت يخدم توّا يا بطل")
 
 tg_app.add_handler(CommandHandler("start", start))
 
