@@ -6,23 +6,16 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 app = FastAPI()
-telegram_app = Application.builder().token(TOKEN).build()
+tg_app = Application.builder().token(TOKEN).build()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ البوت يخدم و يجاوب")
+    await update.message.reply_text("✅ البوت يخدم توّا")
 
-telegram_app.add_handler(CommandHandler("start", start))
-
-@app.on_event("startup")
-async def startup():
-    await telegram_app.initialize()
-    await telegram_app.bot.set_webhook(
-        url="https://telegrambotclean-openaiapikey.up.railway.app/webhook"
-    )
+tg_app.add_handler(CommandHandler("start", start))
 
 @app.post("/webhook")
-async def webhook(req: Request):
-    data = await req.json()
-    update = Update.de_json(data, telegram_app.bot)
-    await telegram_app.process_update(update)
+async def webhook(request: Request):
+    data = await request.json()
+    update = Update.de_json(data, tg_app.bot)
+    await tg_app.process_update(update)
     return {"ok": True}
