@@ -1,47 +1,29 @@
 import os
 from fastapi import FastAPI, Request
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
 app = FastAPI()
+bot = Bot(token=TOKEN)
 
-tg_app = Application.builder().token(TOKEN).build()
+application = Application.builder().token(TOKEN).build()
 
-# 🔴 هذا هو السطر اللي كان ناقص شهر
-@app.on_event("startup")
-async def startup():
-    await tg_app.initialize()
-    await tg_app.start()
-
-@app.on_event("shutdown")
-async def shutdown():
-    await tg_app.stop()
-    await tg_app.shutdown()
-
+# ====== Handlers ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ البوت يخدم توّا")
+    await update.message.reply_text("🤖 البوت يخدم توّا، مرحبا بيك!")
 
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(update.message.text)
+application.add_handler(CommandHandler("start", start))
 
-tg_app.add_handler(CommandHandler("start", start))
-tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+# ====== Routes ======
+@app.get("/")
+async def root():
+    return {"status": "alive"}
 
 @app.post("/webhook")
-async def webhook(req: Request):
-    data = await req.json()
-    update = Update.de_json(data, tg_app.bot)
-    await tg_app.process_update(update)
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    update = Update.de_json(data, bot)
+    await application.process_update(update)
     return {"ok": True}
-
-@app.get("/")
-def root():
-    return {"status": "alive"}
