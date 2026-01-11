@@ -1,29 +1,31 @@
 import os
 from fastapi import FastAPI, Request
-from telegram import Bot, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+import requests
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 app = FastAPI()
-bot = Bot(token=TOKEN)
 
-application = Application.builder().token(TOKEN).build()
-
-# ====== Handlers ======
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 البوت يخدم توّا، مرحبا بيك!")
-
-application.add_handler(CommandHandler("start", start))
-
-# ====== Routes ======
 @app.get("/")
-async def root():
+def alive():
     return {"status": "alive"}
 
 @app.post("/webhook")
-async def telegram_webhook(request: Request):
+async def webhook(request: Request):
     data = await request.json()
-    update = Update.de_json(data, bot)
-    await application.process_update(update)
+
+    if "message" in data:
+        chat_id = data["message"]["chat"]["id"]
+        text = data["message"].get("text", "")
+
+        if text.startswith("/start"):
+            requests.post(
+                f"{API_URL}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": "✅ البوت يخدم توّا (نسخة بسيطة)"
+                }
+            )
+
     return {"ok": True}
