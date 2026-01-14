@@ -1,5 +1,6 @@
 python-telegram-bot==20.7
-openai>=1.0.0
+openai>=1.40.0
 requests>=2.31.0
-ccxt>=4.0.0
-
+yfinance>=0.2.43
+pandas>=2.2.2
+matplotlib>=3.8.4
