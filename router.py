@@ -1,18 +1,18 @@
-from analysis import analyze
-from signals import signal
-from ai_chat import chat
-from whale import scan_whales
+from analysis import analyze_asset
+from signals import generate_signal
+from scanner import find_opportunity
+from chat_ai import ai_reply
 
-def route_message(text):
+def route_message(text: str) -> str:
     t = text.lower()
 
-    if "تحليل" in t or "btc" in t or "eth" in t:
-        return analyze(t)
+    if any(x in t for x in ["btc", "eth", "gold", "xau", "tsla"]):
+        return analyze_asset(t)
 
-    if "إشارة" in t or "صفقة" in t:
-        return signal(t)
+    if any(x in t for x in ["صفقة", "signal", "شراء", "بيع"]):
+        return generate_signal(t)
 
-    if "حيتان" in t or "volume" in t:
-        return scan_whales()
+    if any(x in t for x in ["عملة رابحة", "فرصة", "صيد"]):
+        return find_opportunity()
 
-    return chat(text)
+    return ai_reply(text)
