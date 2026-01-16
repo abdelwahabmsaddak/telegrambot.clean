@@ -1,6 +1,7 @@
 from dataclasses import dataclass, asdict
 from typing import Dict, Any
-from market_data import quick_market_snapshot, normalize_symbol_guess, get_crypto_quote, get_stock_quote, get_gold_quote, CRYPTO_MAP
+from data_providers import get_asset_price
+from analysis_engine import build_signal
 
 _USERS: Dict[int, Dict[str, Any]] = {}
 _PAPER: Dict[int, Dict[str, Any]] = {}  # uid -> {symbol: {...}}
