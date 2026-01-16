@@ -12,7 +12,7 @@ from storage import get_user, update_user, init_db
 from utils import detect_lang, normalize_symbol, split_watchlist
 from analysis_engine import build_analysis, build_signal
 from data_providers import top_crypto_movers, whale_alert_recent
-from trading_engine import paper_open, paper_close, paper_status, set_auto, auto_tick, set_watchlist
+from trading_engine import paper_open, paper_close, paper_status, auto_tick, set_watchlist
 from ai_engine import ask_ai
 
 from openai import OpenAI
