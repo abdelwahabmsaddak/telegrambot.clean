@@ -134,3 +134,42 @@ def paper_close(user_id, symbol):
         "user": user_id,
         "symbol": symbol
     }
+# ==============================
+# Paper Trading (Mock Engine)
+# ==============================
+
+_PAPER_TRADES = {}
+
+def paper_open(user_id, symbol, side, amount):
+    _PAPER_TRADES[user_id] = {
+        "symbol": symbol,
+        "side": side,
+        "amount": amount,
+        "status": "OPEN"
+    }
+    return f"✅ Paper trade مفتوحة: {symbol} | {side} | {amount}$"
+
+def paper_close(user_id):
+    trade = _PAPER_TRADES.get(user_id)
+    if not trade:
+        return "⚠️ لا توجد صفقة Paper مفتوحة."
+    trade["status"] = "CLOSED"
+    return f"❌ تم غلق صفقة {trade['symbol']}"
+
+def paper_status(user_id):
+    trade = _PAPER_TRADES.get(user_id)
+    if not trade:
+        return "📭 لا توجد صفقات Paper."
+    return (
+        f"📊 Paper Status:\n"
+        f"Symbol: {trade['symbol']}\n"
+        f"Side: {trade['side']}\n"
+        f"Amount: {trade['amount']}$\n"
+        f"Status: {trade['status']}"
+    )
+
+def set_watchlist(user_id, symbols):
+    return f"👀 Watchlist تم ضبطها: {', '.join(symbols)}"
+
+def auto_tick():
+    return "🤖 Auto trading tick (simulation)"
