@@ -117,3 +117,20 @@ def paper_trade_status(uid: int) -> str:
         pnl_pct = (pnl / pos["usd"]) * 100.0
         lines.append(f"- {sym} {side} entry={entry:.6f} now={p:.6f} PnL={pnl:.2f}$ ({pnl_pct:.2f}%)")
     return "\n".join(lines)
+# ===== Paper Trading API =====
+
+def paper_open(user_id, symbol, side, amount):
+    return {
+        "status": "opened",
+        "user": user_id,
+        "symbol": symbol,
+        "side": side,
+        "amount": amount
+    }
+
+def paper_close(user_id, symbol):
+    return {
+        "status": "closed",
+        "user": user_id,
+        "symbol": symbol
+    }
