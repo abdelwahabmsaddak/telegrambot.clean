@@ -1,48 +1,39 @@
 import os
 from openai import OpenAI
-from utils import detect_lang
 
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+def detect_lang(text: str):
+    # عربي لو فيه حروف عربية
+    for c in text:
+        if '\u0600' <= c <= '\u06FF':
+            return "ar"
+    return "en"
 
-SYSTEM_AR = (
-    "أنت مساعد تداول محترف مثل ChatGPT لكن متخصص بالأسواق (كريبتو/أسهم/ذهب). "
-    "أجب بالعربية فقط. "
-    "قدّم: ملخص، تحليل، سيناريوهات، إدارة مخاطر، وتحذير واضح. "
-    "لا تعد بأرباح ولا تعطي أوامر تنفيذ مضمونة. "
-    "إذا طلب المستخدم تداول آلي: اقترح Paper Trading أولاً."
-)
+def ai_chat(user_text: str):
+    lang = detect_lang(user_text)
 
-SYSTEM_EN = (
-    "You are a professional trading assistant (crypto/stocks/gold), ChatGPT-style. "
-    "Reply in English only. "
-    "Provide: summary, analysis, scenarios, risk management, and clear warnings. "
-    "No profit promises and no guaranteed trade commands. "
-    "If user asks for automation: suggest paper trading first."
-)
-
-def ask_ai(user_text: str, lang_mode: str = "auto", extra_context: str = "") -> str:
-    if not user_text:
-        return ""
-    if lang_mode == "auto":
-        lang = detect_lang(user_text)
+    if lang == "ar":
+        system_prompt = (
+            "أنت مساعد تداول ذكي ومحترف. "
+            "تجيب بالعربية فقط. "
+            "اشرح بوضوح وبأسلوب بسيط. "
+            "إذا كان السؤال عن التداول، العملات، الأسهم أو الذهب أجب بدقة."
+        )
     else:
-        lang = lang_mode
+        system_prompt = (
+            "You are a professional AI trading assistant. "
+            "Reply in English only. "
+            "Explain clearly and simply."
+        )
 
-    system = SYSTEM_AR if lang == "ar" else SYSTEM_EN
-
-    messages = [
-        {"role": "system", "content": system},
-    ]
-    if extra_context:
-        messages.append({"role": "system", "content": extra_context})
-    messages.append({"role": "user", "content": user_text})
-
-    r = client.chat.completions.create(
-        model=DEFAULT_MODEL,
-        messages=messages,
-        temperature=0.6,
-        max_tokens=900,
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text}
+        ],
+        temperature=0.7
     )
-    return (r.choices[0].message.content or "").strip()
+
+    return response.choices[0].message.content.strip()
