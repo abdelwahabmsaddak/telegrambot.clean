@@ -1,96 +1,70 @@
-# bot.py
 # -*- coding: utf-8 -*-
 
 import os
 import sys
-import asyncio
-from telegram import Update, ReplyKeyboardMarkup
+import io
+import logging
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
-    filters
+    filters,
 )
 
 from ai_engine import ai_chat
+from utils import safe_text
 
-# =========================
-# Force UTF-8 (IMPORTANT)
-# =========================
-sys.stdout.reconfigure(encoding="utf-8")
+# ===== UTF-8 FIX (مهم جدا) =====
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# =========================
-# User Settings (simple)
-# =========================
-USERS = {}
+if not TOKEN:
+    raise RuntimeError("❌ TELEGRAM_BOT_TOKEN not set")
 
-def get_user(uid):
-    if uid not in USERS:
-        USERS[uid] = {"lang": "auto"}
-    return USERS[uid]
 
-# =========================
-# Start Command
-# =========================
+# ===== Commands =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        ["📊 Analysis", "💬 Chat"],
-        ["⚙️ Settings"]
-    ]
-    await update.message.reply_text(
-        "🤖 AI Trading Bot Ready\n"
-        "اسأل أي سؤال في التداول 👇",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    msg = (
+        "🤖 Smart Trading Bot\n\n"
+        "اكتب أي سؤال تداول:\n"
+        "BTC / ETH / GOLD / أسهم\n\n"
+        "أو اسأل بالعربي أو بالإنجليزي."
     )
+    await update.message.reply_text(msg)
 
-# =========================
-# Language Command
-# =========================
-async def lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = get_user(update.effective_user.id)
 
-    if not context.args:
-        await update.message.reply_text("Use: /lang ar  or  /lang en")
-        return
+async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
 
-    if context.args[0].lower() in ["ar", "arabic"]:
-        user["lang"] = "ar"
-        await update.message.reply_text("✅ اللغة العربية مفعّلة")
-    elif context.args[0].lower() in ["en", "english"]:
-        user["lang"] = "en"
-        await update.message.reply_text("✅ English enabled")
-    else:
-        await update.message.reply_text("❌ Unknown language")
+    try:
+        reply = ai_chat(user_text)
+        await update.message.reply_text(safe_text(reply))
+    except Exception as e:
+        logging.exception("AI ERROR")
+        await update.message.reply_text(
+            "❌ حصل خطأ في الذكاء الاصطناعي. حاول لاحقًا."
+        )
 
-# =========================
-# Text Messages (AI CHAT)
-# =========================
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = get_user(update.effective_user.id)
-    text = update.message.text
 
-    # clean & safe AI call
-    reply = ai_chat(text, user["lang"])
-    reply = reply.encode("utf-8", errors="ignore").decode("utf-8")
-
-    await update.message.reply_text(reply)
-
-# =========================
-# Main
-# =========================
+# ===== Main =====
 def main():
-    print("🤖 AI BOT RUNNING...")
-
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("lang", lang))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
 
-    app.run_polling(close_loop=False)
+    print("🤖 AI BOT RUNNING...")
+    app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
