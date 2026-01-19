@@ -1,105 +1,96 @@
+# bot.py
+# -*- coding: utf-8 -*-
+
 import os
-import re
-from telegram import Update
+import sys
+import asyncio
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
-    filters,
+    filters
 )
-from openai import OpenAI
 
-# ================== ENV ==================
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
+from ai_engine import ai_chat
 
-client = OpenAI(api_key=OPENAI_KEY)
+# =========================
+# Force UTF-8 (IMPORTANT)
+# =========================
+sys.stdout.reconfigure(encoding="utf-8")
 
-# ================== UTILS ==================
-def clean_text(text: str) -> str:
-    if not text:
-        return ""
-    # remove hidden RTL/LTR chars
-    text = text.replace("\u200e", "").replace("\u200f", "")
-    return text.strip()
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-def detect_lang(text: str) -> str:
-    # Arabic detection
-    if re.search(r"[\u0600-\u06FF]", text):
-        return "ar"
-    return "en"
+# =========================
+# User Settings (simple)
+# =========================
+USERS = {}
 
-# ================== AI ==================
-def ai_reply(message: str) -> str:
-    message = clean_text(message)
-    lang = detect_lang(message)
+def get_user(uid):
+    if uid not in USERS:
+        USERS[uid] = {"lang": "auto"}
+    return USERS[uid]
 
-    system_prompt = (
-        "أنت مساعد تداول ذكي ومحترف." if lang == "ar"
-        else "You are a professional AI trading assistant."
-    )
-
-    rules = (
-        "جاوب بنفس لغة المستخدم فقط. "
-        "قدّم تحليل، إدارة مخاطر، شرح، بدون تنفيذ صفقات حقيقية."
-        if lang == "ar"
-        else
-        "Reply in the same language only. "
-        "Provide analysis, risk management, explanations. No real trades."
-    )
-
-    try:
-        res = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": system_prompt + " " + rules},
-                {"role": "user", "content": message},
-            ],
-            temperature=0.7,
-        )
-        return res.choices[0].message.content.strip()
-    except Exception as e:
-        return f"❌ AI Error: {e}"
-
-# ================== HANDLERS ==================
+# =========================
+# Start Command
+# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        ["📊 Analysis", "💬 Chat"],
+        ["⚙️ Settings"]
+    ]
     await update.message.reply_text(
-        "🤖 Smart Trading AI Bot\n\n"
-        "اكتب أي سؤال في التداول (عملات رقمية، أسهم، ذهب)\n"
-        "أو أي سؤال عام، وسأجيبك بالذكاء الاصطناعي.\n\n"
-        "🧠 AI Ready ✅"
+        "🤖 AI Trading Bot Ready\n"
+        "اسأل أي سؤال في التداول 👇",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "/start – تشغيل البوت\n"
-        "/help – مساعدة\n\n"
-        "✍️ فقط اكتب سؤالك مباشرة."
-    )
+# =========================
+# Language Command
+# =========================
+async def lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_user.id)
 
-async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = clean_text(update.message.text)
-
-    if not user_text:
+    if not context.args:
+        await update.message.reply_text("Use: /lang ar  or  /lang en")
         return
 
-    reply = ai_reply(user_text)
+    if context.args[0].lower() in ["ar", "arabic"]:
+        user["lang"] = "ar"
+        await update.message.reply_text("✅ اللغة العربية مفعّلة")
+    elif context.args[0].lower() in ["en", "english"]:
+        user["lang"] = "en"
+        await update.message.reply_text("✅ English enabled")
+    else:
+        await update.message.reply_text("❌ Unknown language")
+
+# =========================
+# Text Messages (AI CHAT)
+# =========================
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_user.id)
+    text = update.message.text
+
+    # clean & safe AI call
+    reply = ai_chat(text, user["lang"])
+    reply = reply.encode("utf-8", errors="ignore").decode("utf-8")
+
     await update.message.reply_text(reply)
 
-# ================== MAIN ==================
+# =========================
+# Main
+# =========================
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("❌ TELEGRAM_BOT_TOKEN غير موجود")
+    print("🤖 AI BOT RUNNING...")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
+    app.add_handler(CommandHandler("lang", lang))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🤖 AI BOT RUNNING...")
-    app.run_polling()
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
