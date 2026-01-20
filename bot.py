@@ -353,29 +353,33 @@ async def auto_loop(context: ContextTypes.DEFAULT_TYPE):
             pass
 
 def main():
-    from telegram.ext import ApplicationBuilder
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .build()
+    )
 
-app = (
-    ApplicationBuilder()
-    .token(TOKEN)
-    .build()
-)
-
+    # ===== Handlers =====
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("lang", lang_cmd))
-    app.add_handler(CommandHandler("auto", auto_cmd))
-    app.add_handler(CommandHandler("scan", scan_cmd))
-    app.add_handler(CommandHandler("analysis", analysis_cmd))
-    app.add_handler(CommandHandler("chart", chart_cmd))
-    app.add_handler(CommandHandler("paper", paper_cmd))
+    app.add_handler(CommandHandler("analysis", cmd_analysis))
+    app.add_handler(CommandHandler("signal", cmd_signal))
+    app.add_handler(CommandHandler("scan", cmd_scan))
+    app.add_handler(CommandHandler("whales", cmd_whales))
+    app.add_handler(CommandHandler("chat", cmd_chat))
+    app.add_handler(CommandHandler("settings", cmd_settings))
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    # Auto engine job: runs every 2 minutes
-    app.job_queue.run_repeating(auto_loop, interval=120, first=20)
+    # ===== Auto loop =====
+    app.job_queue.run_repeating(
+        auto_loop,
+        interval=120,
+        first=20
+    )
 
-    log.info("🤖 BOT RUNNING...")
-    app.run_polling(drop_pending_updates=True)
+    print("🤖 BOT RUNNING...")
+    app.run_polling()
+
 
 if __name__ == "__main__":
     main()
