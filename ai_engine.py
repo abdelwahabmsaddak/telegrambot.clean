@@ -1,86 +1,71 @@
 # ai_engine.py
-# -*- coding: utf-8 -*-
-
 import os
 import re
-from typing import Optional
-
 from openai import OpenAI
 
-# Removes invisible bidi / direction marks that often break logs/encoding
-_BIDI_RE = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+# Force a safe default model; you can override with env OPENAI_MODEL
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-def sanitize_text(text: str) -> str:
-    if not text:
+# Create client once
+_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Remove invisible direction marks + control chars that cause encoding issues
+_INVISIBLE = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+_CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+def sanitize_text(s: str) -> str:
+    if not s:
         return ""
-    text = _BIDI_RE.sub("", text)
-    return text.strip()
+    s = _INVISIBLE.sub("", s)
+    s = _CTRL.sub("", s)
+    return s.strip()
 
-class AIEngine:
-    def __init__(self):
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        if not api_key:
-            raise RuntimeError("Missing OPENAI_API_KEY env var")
-
-        self.client = OpenAI(api_key=api_key)
-        self.model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")  # you can change in Railway env
-
-        # System prompts separated by language (no mixing)
-        self.system_ar = (
-            "أنت مساعد تداول محترف داخل بوت تيليغرام. "
-            "اكتب بالعربية فقط. "
-            "قدّم شرحًا واضحًا ومنظمًا. "
-            "لا تعد بربح مضمون ولا تعطي أوامر شراء/بيع إلزامية. "
-            "إذا سُئلت عن (تحليل/إدارة مخاطر/استراتيجية) قدّم خطوات عملية وأمثلة. "
-            "إذا طلب المستخدم قرار تداول، أعطِ سيناريوهات محتملة + مستويات مراقبة + إدارة مخاطر."
+def build_system_prompt(lang: str) -> str:
+    # lang is "ar" or "en"
+    if lang == "ar":
+        return (
+            "أنت مساعد تداول ذكي داخل بوت تيليغرام.\n"
+            "القواعد:\n"
+            "- جاوب بالعربية فقط.\n"
+            "- قدم تحليل/تعليم وإدارة مخاطر، ولا تعد بأرباح.\n"
+            "- إذا طلب المستخدم تنفيذ تداول فعلي: وضّح أنه اختياري وأنك لا تنفذ صفقات حقيقية.\n"
+            "- اجعل الردود عملية: نقاط + مستويات محتملة + سيناريوهين (صعود/هبوط).\n"
+            "- اذكر تنبيه: 'هذا ليس نصيحة مالية'.\n"
         )
+    return (
+        "You are a smart trading assistant inside a Telegram bot.\n"
+        "Rules:\n"
+        "- Reply in English only.\n"
+        "- Provide educational analysis and risk management; no promises of profit.\n"
+        "- If user asks to execute real trades: explain it is optional and you do not place real orders.\n"
+        "- Be practical: bullets + possible levels + 2 scenarios (bull/bear).\n"
+        "- Include: 'Not financial advice.'\n"
+    )
 
-        self.system_en = (
-            "You are a professional trading assistant inside a Telegram bot. "
-            "Write in English only. "
-            "Be structured and practical. "
-            "Never promise guaranteed profit. "
-            "If asked for a trade decision, provide scenarios, key levels to watch, and risk management."
-        )
+def ai_chat(user_text: str, lang: str = "ar") -> str:
+    """
+    Returns AI response text (sanitized). Raises exception upward (bot.py handles it).
+    Uses OpenAI Responses API. 1
+    """
+    user_text = sanitize_text(user_text)
+    if not user_text:
+        return "اكتب سؤالك." if lang == "ar" else "Type your question."
 
-    def _system_for_lang(self, lang: str) -> str:
-        return self.system_ar if lang == "ar" else self.system_en
+    system = build_system_prompt(lang)
 
-    def answer(self, *, lang: str, user_text: str, context_hint: Optional[str] = None) -> str:
-        """
-        Returns a clean AI answer in the same language requested.
-        Uses OpenAI Responses API (recommended in official SDK).  1
-        """
-        lang = "ar" if lang == "ar" else "en"
-        user_text = sanitize_text(user_text)
-        context_hint = sanitize_text(context_hint or "")
+    resp = _client.responses.create(
+        model=DEFAULT_MODEL,
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_text},
+        ],
+    )
 
-        if not user_text:
-            return "اكتب سؤالك." if lang == "ar" else "Please type your question."
+    # response.output_text is the simplest extraction method in the SDK
+    out = getattr(resp, "output_text", "") or ""
+    out = sanitize_text(out)
 
-        system = self._system_for_lang(lang)
-
-        # Build one prompt (simple + stable)
-        prompt = user_text
-        if context_hint:
-            if lang == "ar":
-                prompt = f"معلومات سياق:\n{context_hint}\n\nسؤال المستخدم:\n{user_text}"
-            else:
-                prompt = f"Context:\n{context_hint}\n\nUser question:\n{user_text}"
-
-        # Responses API
-        resp = self.client.responses.create(
-            model=self.model,
-            input=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ],
-        )
-
-        # The SDK provides output_text for convenience
-        text = getattr(resp, "output_text", "") or ""
-        text = sanitize_text(text)
-
-        if not text:
-            return "صار خطأ في الرد." if lang == "ar" else "Something went wrong generating a reply."
-        return text
+    if not out:
+        # fallback
+        return "حصل خطأ بسيط، جرّب مرة أخرى." if lang == "ar" else "Temporary issue, please try again."
+    return out
