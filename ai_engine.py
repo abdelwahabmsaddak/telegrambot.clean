@@ -3,116 +3,84 @@
 
 import os
 import re
-import sys
-from typing import Dict, List
+from typing import Optional
 
-from openai import OpenAI  # pip install openai
+from openai import OpenAI
 
+# Removes invisible bidi / direction marks that often break logs/encoding
+_BIDI_RE = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
-# --- Force UTF-8 stdout (avoids ascii codec crashes in some hosts) ---
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
-except Exception:
-    pass
-
-
-# Characters that often break ASCII encoders (Arabic keyboards insert these)
-_BIDI_CONTROL_CHARS = [
-    "\u200e",  # LRM
-    "\u200f",  # RLM
-    "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",  # bidi overrides
-]
-
-
-def sanitize_text(s: str) -> str:
-    if not s:
+def sanitize_text(text: str) -> str:
+    if not text:
         return ""
-    # remove bidi controls
-    for ch in _BIDI_CONTROL_CHARS:
-        s = s.replace(ch, "")
-    # remove other invisible control chars except newline/tab
-    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
-    return s.strip()
-
-
-def detect_lang_auto(text: str) -> str:
-    # Very simple: if Arabic letters exist => ar else en
-    if re.search(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]", text or ""):
-        return "ar"
-    return "en"
-
-
-def build_system_prompt(lang: str) -> str:
-    if lang == "ar":
-        return (
-            "أنت مساعد تداول ذكي داخل بوت تيليجرام.\n"
-            "قواعد مهمة:\n"
-            "- اكتب بالعربية فقط.\n"
-            "- قدّم تحليلًا تعليميًا وإدارة مخاطر، ولا تعطِ وعود ربح.\n"
-            "- إذا سأل المستخدم عن تنفيذ تداول حقيقي: وضّح أنه غير مفعّل إلا إذا فعّل (Auto) "
-            "وأنه افتراضيًا Paper فقط.\n"
-            "- عند عدم توفر بيانات سعر لحظية، وضّح ذلك وقدّم خطوات تحليل عامة.\n"
-        )
-    return (
-        "You are a trading assistant inside a Telegram bot.\n"
-        "Rules:\n"
-        "- Reply in English only.\n"
-        "- Provide educational analysis and risk management. No profit promises.\n"
-        "- Real trading is disabled by default (paper only) unless user enables Auto.\n"
-        "- If live pricing isn't available, say so and give general analysis steps.\n"
-    )
-
+    text = _BIDI_RE.sub("", text)
+    return text.strip()
 
 class AIEngine:
     def __init__(self):
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing.")
+            raise RuntimeError("Missing OPENAI_API_KEY env var")
+
         self.client = OpenAI(api_key=api_key)
-        self.model = os.getenv("OPENAI_MODEL", "gpt-4.1")  # example model in docs 1
+        self.model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")  # you can change in Railway env
 
-    def chat(self, user_text: str, lang_mode: str = "auto", history: List[Dict] | None = None) -> str:
+        # System prompts separated by language (no mixing)
+        self.system_ar = (
+            "أنت مساعد تداول محترف داخل بوت تيليغرام. "
+            "اكتب بالعربية فقط. "
+            "قدّم شرحًا واضحًا ومنظمًا. "
+            "لا تعد بربح مضمون ولا تعطي أوامر شراء/بيع إلزامية. "
+            "إذا سُئلت عن (تحليل/إدارة مخاطر/استراتيجية) قدّم خطوات عملية وأمثلة. "
+            "إذا طلب المستخدم قرار تداول، أعطِ سيناريوهات محتملة + مستويات مراقبة + إدارة مخاطر."
+        )
+
+        self.system_en = (
+            "You are a professional trading assistant inside a Telegram bot. "
+            "Write in English only. "
+            "Be structured and practical. "
+            "Never promise guaranteed profit. "
+            "If asked for a trade decision, provide scenarios, key levels to watch, and risk management."
+        )
+
+    def _system_for_lang(self, lang: str) -> str:
+        return self.system_ar if lang == "ar" else self.system_en
+
+    def answer(self, *, lang: str, user_text: str, context_hint: Optional[str] = None) -> str:
+        """
+        Returns a clean AI answer in the same language requested.
+        Uses OpenAI Responses API (recommended in official SDK).  1
+        """
+        lang = "ar" if lang == "ar" else "en"
         user_text = sanitize_text(user_text)
-        history = history or []
+        context_hint = sanitize_text(context_hint or "")
 
-        lang = detect_lang_auto(user_text) if lang_mode == "auto" else lang_mode
-        system_prompt = build_system_prompt(lang)
+        if not user_text:
+            return "اكتب سؤالك." if lang == "ar" else "Please type your question."
 
-        # Build input messages
-        input_messages = [{"role": "system", "content": system_prompt}]
-        # Keep short history (optional)
-        for m in history[-8:]:
-            role = m.get("role", "user")
-            content = sanitize_text(m.get("content", ""))
-            if content:
-                input_messages.append({"role": role, "content": content})
-        input_messages.append({"role": "user", "content": user_text})
+        system = self._system_for_lang(lang)
 
-        try:
-            # OpenAI Responses API (Python)
-            resp = self.client.responses.create(
-                model=self.model,
-                input=input_messages,
-            )
-            # Most convenient text getter
-            text = getattr(resp, "output_text", None)
-            if text:
-                return sanitize_text(text)
+        # Build one prompt (simple + stable)
+        prompt = user_text
+        if context_hint:
+            if lang == "ar":
+                prompt = f"معلومات سياق:\n{context_hint}\n\nسؤال المستخدم:\n{user_text}"
+            else:
+                prompt = f"Context:\n{context_hint}\n\nUser question:\n{user_text}"
 
-            # Fallback: try to extract from output list (defensive)
-            out = getattr(resp, "output", []) or []
-            for item in out:
-                content = item.get("content") if isinstance(item, dict) else None
-                if isinstance(content, list):
-                    for c in content:
-                        if isinstance(c, dict) and c.get("type") in ("output_text", "text"):
-                            t = c.get("text", "")
-                            if t:
-                                return sanitize_text(t)
+        # Responses API
+        resp = self.client.responses.create(
+            model=self.model,
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+        )
 
-            return "AI: Empty response."
-        except Exception as e:
-            # Return safe text without triggering ascii encoding
-            err = sanitize_text(str(e))
-            return f"AI Error: {err}"
+        # The SDK provides output_text for convenience
+        text = getattr(resp, "output_text", "") or ""
+        text = sanitize_text(text)
+
+        if not text:
+            return "صار خطأ في الرد." if lang == "ar" else "Something went wrong generating a reply."
+        return text
