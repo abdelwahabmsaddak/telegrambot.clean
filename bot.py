@@ -353,7 +353,13 @@ async def auto_loop(context: ContextTypes.DEFAULT_TYPE):
             pass
 
 def main():
-    app = Application.builder().token(TOKEN).build()
+    from telegram.ext import ApplicationBuilder
+
+app = (
+    ApplicationBuilder()
+    .token(TOKEN)
+    .build()
+)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("lang", lang_cmd))
