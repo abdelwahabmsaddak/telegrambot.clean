@@ -354,7 +354,7 @@ async def auto_loop(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = (
-        ApplicationBuilder()
+        Application.builder()
         .token(TOKEN)
         .build()
     )
