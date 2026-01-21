@@ -1,0 +1,58 @@
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    lang = detect_lang(text)
+
+    # ========= ANALYSIS BUTTON =========
+    if text in ["📊 Analysis", "تحليل"]:
+        await update.message.reply_text(
+            "📊 أرسل الرمز:\nBTC / ETH / XAUUSD / TSLA"
+        )
+        context.user_data["mode"] = "analysis"
+        return
+
+    # ========= SYMBOL ANALYSIS =========
+    if context.user_data.get("mode") == "analysis":
+        symbol = text.upper()
+
+        if symbol not in VALID_SYMBOLS:
+            await update.message.reply_text(
+                "❌ رمز غير معروف.\nاستخدم: BTC / ETH / XAUUSD / TSLA"
+                if lang == "ar"
+                else
+                "❌ Unknown symbol. Use: BTC / ETH / XAUUSD / TSLA"
+            )
+            return
+
+        # 🔥 تحليل بدون AI (مضمون)
+        await update.message.reply_text(
+            f"📊 تحليل {symbol}\n\n"
+            f"- الاتجاه العام: صاعد / عرضي\n"
+            f"- دعم مهم: قيد التحديث\n"
+            f"- مقاومة: قيد التحديث\n\n"
+            f"⚠️ تحليل تعليمي فقط"
+        )
+        context.user_data["mode"] = None
+        return
+
+    # ========= CHAT MODE =========
+    if text in ["💬 Chat", "دردشة"]:
+        context.user_data["mode"] = "chat"
+        await update.message.reply_text(
+            "💬 وضع الدردشة مفعل"
+            if lang == "ar"
+            else
+            "💬 Chat mode enabled"
+        )
+        return
+
+    if context.user_data.get("mode") == "chat":
+        try:
+            await update.message.reply_text(ai_answer(text, lang))
+        except:
+            await update.message.reply_text(
+                "❌ الذكاء الاصطناعي غير متوفر حالياً"
+                if lang == "ar"
+                else
+                "❌ AI temporarily unavailable"
+            )
+        return
