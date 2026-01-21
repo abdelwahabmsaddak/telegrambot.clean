@@ -1,5 +1,6 @@
 import os
 import logging
+from chart_engine import generate_chart
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
