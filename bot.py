@@ -75,6 +75,14 @@ def ai_answer(prompt: str, lang: str) -> str:
 
     return response.choices[0].message.content.strip()
 
+chart_path = generate_chart(symbol)
+
+if chart_path:
+    await update.message.reply_photo(
+        photo=open(chart_path, "rb"),
+        caption=f"📊 {symbol} – Chart"
+    )
+    
 # =======================
 # COMMANDS
 # =======================
