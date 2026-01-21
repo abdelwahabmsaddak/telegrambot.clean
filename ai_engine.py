@@ -1,56 +1,82 @@
-# ai_engine.py
+ # ai_engine.py
 import os
-from openai import OpenAI
-from utils import sanitize_text
+import re
+from typing import Optional
+
+# Optional OpenAI (safe import)
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+
+# بعض رموز اتجاه النص تسبب مشاكل encoding / عرض (مثل \u200e)
+_BIDI_MARKS_RE = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def clean_text(s: str) -> str:
+    if not s:
+        return ""
+    s = _BIDI_MARKS_RE.sub("", s)
+    s = s.replace("\x00", "")
+    return s.strip()
+
 
 class AIEngine:
-    def __init__(self):
-        key = (os.getenv("OPENAI_API_KEY") or "").strip()
-        if not key:
-            raise RuntimeError("Missing OPENAI_API_KEY")
-        self.client = OpenAI(api_key=key)
-        self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        timeout: float = 30.0,
+    ):
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY", "").strip()
+        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self.timeout = timeout
+        self._client = None
 
-        self.sys_ar = (
-            "أنت مساعد تداول محترف داخل بوت تيليغرام.\n"
-            "القواعد:\n"
-            "- اكتب بالعربية فقط.\n"
-            "- اعطِ تحليلًا تعليميًا + إدارة مخاطر.\n"
-            "- لا تعد بربح مضمون.\n"
-            "- إذا طلب المستخدم تنفيذ صفقة: وضّح أن التنفيذ Live اختياري ويحتاج تفعيل من العميل.\n"
-            "- في التحليل: سعر حي + اتجاه + دعم/مقاومة + سيناريو صعود/هبوط + مخاطرة.\n"
-            "واختم بـ: هذا ليس نصيحة مالية.\n"
+        if OpenAI and self.api_key:
+            try:
+                self._client = OpenAI(api_key=self.api_key, timeout=self.timeout)
+            except Exception:
+                self._client = None
+
+    def available(self) -> bool:
+        return self._client is not None
+
+    def chat(self, user_text: str, system_prompt: str) -> str:
+        """
+        Returns AI answer if available, otherwise a safe fallback.
+        """
+        user_text = clean_text(user_text)
+        system_prompt = clean_text(system_prompt)
+
+        # Fallback if no key / library / errors
+        if not self.available():
+            return self.fallback_answer(user_text)
+
+        try:
+            resp = self._client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                temperature=0.4,
+                max_tokens=900,
+            )
+            out = resp.choices[0].message.content or ""
+            out = clean_text(out)
+            return out if out else self.fallback_answer(user_text)
+        except Exception:
+            return self.fallback_answer(user_text)
+
+    def fallback_answer(self, user_text: str) -> str:
+        # رد ثابت محترم كي API يطيح/مافيش رصيد
+        return (
+            "⚠️ الذكاء الاصطناعي غير متاح الآن (مفتاح/رصيد/اتصال).\n\n"
+            "✅ نقدر نخدمك بالوضع الثابت:\n"
+            "• Analysis + Chart\n"
+            "• Signals (Paper)\n"
+            "• Auto Paper تنبيهات\n\n"
+            "ابعث رمز واضح مثل: BTC أو ETH أو TSLA أو XAUUSD"
         )
-
-        self.sys_en = (
-            "You are a professional trading assistant inside a Telegram bot.\n"
-            "Rules:\n"
-            "- Reply in English only.\n"
-            "- Provide educational analysis + risk management.\n"
-            "- No guaranteed profits.\n"
-            "- If user asks to execute trades: explain Live execution is optional and must be enabled by the user.\n"
-            "In analysis: live price + trend + S/R + bull/bear scenarios + risk.\n"
-            "End with: Not financial advice.\n"
-        )
-
-    def answer(self, lang: str, user_text: str, context_hint: str = "") -> str:
-        lang = "ar" if lang == "ar" else "en"
-        user_text = sanitize_text(user_text)
-        context_hint = sanitize_text(context_hint)
-
-        system = self.sys_ar if lang == "ar" else self.sys_en
-        if context_hint:
-            if lang == "ar":
-                user_text = f"سياق (بيانات حية):\n{context_hint}\n\nطلب المستخدم:\n{user_text}"
-            else:
-                user_text = f"Context (live data):\n{context_hint}\n\nUser request:\n{user_text}"
-
-        resp = self.client.responses.create(
-            model=self.model,
-            input=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_text},
-            ],
-        )
-        out = getattr(resp, "output_text", "") or ""
-        return sanitize_text(out) or ("حصل خطأ بسيط." if lang == "ar" else "Temporary issue.")
