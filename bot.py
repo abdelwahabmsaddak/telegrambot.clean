@@ -39,6 +39,23 @@ TP2: {signal['tp2']:.2f}
 ⚠️ Paper Trading – إشارة احتمالية وليست تنفيذًا حقيقيًا
 """
 
+async def cmd_signal(update, context):
+    symbol = context.user_data.get("symbol")
+
+    if not symbol:
+        await update.message.reply_text("أرسل الرمز أولاً مثل BTC / ETH / XAUUSD")
+        return
+
+    data = get_market_data(symbol)  # دالة تجيب الداتا
+    signal = generate_signal(symbol, data)
+
+    if not signal:
+        await update.message.reply_text("❌ لا توجد فرصة قوية الآن – السوق غير واضح.")
+        return
+
+    text = format_signal(symbol, signal)
+    await update.message.reply_text(text)
+
 from telegram import (
     Update,
     InlineKeyboardMarkup,
