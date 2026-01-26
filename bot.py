@@ -35,17 +35,20 @@ from telegram.ext import (
 # ---------------------------
 # CONFIG
 # ---------------------------
-load_dotenv()
+import os
+import time
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("smartbot")
+TELEGRAM_TOKEN = None
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+for _ in range(5):  # نحاولو 5 مرات
+    TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+    if TELEGRAM_TOKEN:
+        TELEGRAM_TOKEN = TELEGRAM_TOKEN.strip()
+        break
+    time.sleep(1)
+
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("❌ TELEGRAM_TOKEN غير موجود في ENV")
+    raise RuntimeError("❌ TELEGRAM_TOKEN غير موجود في ENV (Railway delay)")
 
 # Default settings per user
 DEFAULT_EXCHANGE = os.getenv("DEFAULT_EXCHANGE", "bybit").strip().lower()
