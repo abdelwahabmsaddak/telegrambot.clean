@@ -11,6 +11,34 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from signal_engine import generate_signal
+
+def format_signal(symbol, signal):
+    return f"""
+🎯 Smart Signal – {symbol} (Paper Trading)
+
+📈 Type: {signal['type']}
+🧠 Confidence: {signal['confidence']}%
+
+📍 Entry Zone:
+{signal['entry'][0]:.2f} – {signal['entry'][1]:.2f}
+
+🎯 Targets:
+TP1: {signal['tp1']:.2f}
+TP2: {signal['tp2']:.2f}
+
+🛑 Stop Loss:
+{signal['sl']:.2f}
+
+📊 Market Bias:
+{signal['bias']}
+
+⚙️ Strategy:
+{signal['strategy']}
+
+⚠️ Paper Trading – إشارة احتمالية وليست تنفيذًا حقيقيًا
+"""
+
 from telegram import (
     Update,
     InlineKeyboardMarkup,
