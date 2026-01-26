@@ -1,151 +1,282 @@
-# -*- coding: utf-8 -*-
+# bot.py
+# Smart Trading Bot (Crypto + Stocks/Gold via optional API) + Signals + Charts + Auto Paper + Optional Live Trading + Optional AI
+# python-telegram-bot[job-queue]==21.6
+
 import os
-import time
+import io
 import math
+import time
+import json
+import logging
 import asyncio
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-import ccxt
 from dotenv import load_dotenv
+
+import ccxt
 
 from telegram import (
     Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 
+# Optional OpenAI (AI explanations/chat)
+OPENAI_AVAILABLE = True
+try:
+    from openai import OpenAI
+except Exception:
+    OPENAI_AVAILABLE = False
+
 load_dotenv()
 
-# =========================
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("smartbot")
+
+# -----------------------------
 # ENV
-# =========================
+# -----------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()  # optional (AI explanation)
-DEFAULT_EXCHANGE = os.getenv("DEFAULT_EXCHANGE", "binance").strip().lower()
 
-# Auto-scan symbols (you can change)
-DEFAULT_WATCHLIST = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XAUUSD"]  # XAUUSD uses fallback note
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5").strip()
 
-# =========================
-# Simple in-memory user store (production: use DB)
-# =========================
-USERS: Dict[int, Dict[str, Any]] = {}
+# Crypto (ccxt)
+CRYPTO_EXCHANGE_ID = os.getenv("CRYPTO_EXCHANGE_ID", "binance").strip().lower()  # binance by default
 
-def uget(chat_id: int) -> Dict[str, Any]:
-    if chat_id not in USERS:
-        USERS[chat_id] = {
-            "mode": "chat",                # chat | analysis | signal | settings | paper
-            "symbol": None,                # e.g. BTC/USDT
-            "auto_on": False,              # auto trading toggle
-            "paper_on": False,             # auto paper toggle
-            "exchange": DEFAULT_EXCHANGE,  # binance/bybit/okx...
-            "api_key": None,
-            "api_secret": None,
-            "risk_pct": 1.0,               # percent risk per trade
-            "capital": 1000.0,             # virtual/paper capital
-            "last_signal_ts": 0,
-        }
-    return USERS[chat_id]
+# Live trading keys (optional)
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
 
-# =========================
-# Indicators
-# =========================
-def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
+# Stocks/Gold/Forex via TwelveData (optional)
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 
+# Auto loop
+AUTO_INTERVAL_SEC = int(os.getenv("AUTO_INTERVAL_SEC", "300"))  # 5 minutes default
+DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "15m").strip()  # for crypto
+
+# Safety defaults
+DEFAULT_RISK_PCT = float(os.getenv("DEFAULT_RISK_PCT", "1.0"))  # % per trade
+
+
+# -----------------------------
+# UI / States
+# -----------------------------
+MAIN_KB = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("📊 تحليل"), KeyboardButton("🎯 إشارة")],
+        [KeyboardButton("🤖 Auto Paper"), KeyboardButton("⚡ Auto Live")],
+        [KeyboardButton("🧠 دردشة"), KeyboardButton("⚙️ إعدادات")],
+        [KeyboardButton("🧾 Scan"), KeyboardButton("🐋 Whales")],
+    ],
+    resize_keyboard=True,
+)
+
+STATE_KEY = "state"
+STATE_NONE = "none"
+STATE_WAIT_SYMBOL_ANALYSIS = "wait_symbol_analysis"
+STATE_WAIT_SYMBOL_SIGNAL = "wait_symbol_signal"
+STATE_WAIT_SYMBOL_SCAN = "wait_symbol_scan"
+STATE_WAIT_CHAT = "wait_chat"
+STATE_WAIT_CAPITAL = "wait_capital"
+
+# Per-user keys saved in user_data
+UD_SYMBOL = "symbol"
+UD_MARKET = "market"  # "crypto" or "twelvedata"
+UD_CAPITAL = "capital"
+UD_RISK = "risk_pct"
+UD_AI = "ai_enabled"
+UD_AUTO_PAPER = "auto_paper_on"
+UD_AUTO_LIVE = "auto_live_on"
+UD_POSITIONS = "paper_positions"  # dict symbol-> position
+UD_CONFIRM_LIVE = "confirm_live"  # step confirmation
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def is_crypto_symbol(sym: str) -> bool:
+    # Accept BTC, ETH, SOL, etc. And BTCUSDT / BTC/USDT
+    s = sym.upper().replace(" ", "")
+    if "/" in s:
+        base, quote = s.split("/", 1)
+        return base.isalnum() and quote.isalnum()
+    if s.endswith("USDT") and len(s) >= 6:
+        return True
+    # plain BTC/ETH -> treat as crypto base with USDT
+    return s.isalpha() and 2 <= len(s) <= 10
+
+
+def normalize_crypto_symbol(sym: str) -> str:
+    s = sym.upper().replace(" ", "")
+    if "/" in s:
+        return s
+    if s.endswith("USDT") and len(s) >= 6:
+        base = s[:-4]
+        return f"{base}/USDT"
+    # BTC -> BTC/USDT
+    return f"{s}/USDT"
+
+
+def human_money(x: float) -> str:
+    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+        return "-"
+    if abs(x) >= 1000:
+        return f"{x:,.2f}"
+    return f"{x:.4f}".rstrip("0").rstrip(".")
+
+
+def safe_float(text: str) -> Optional[float]:
+    try:
+        t = text.replace(",", ".").strip()
+        return float(t)
+    except Exception:
+        return None
+
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+# -----------------------------
+# Market Data Providers
+# -----------------------------
+class CryptoData:
+    def __init__(self):
+        if CRYPTO_EXCHANGE_ID not in ccxt.exchanges:
+            raise ValueError(f"Unsupported exchange id: {CRYPTO_EXCHANGE_ID}")
+        ex_class = getattr(ccxt, CRYPTO_EXCHANGE_ID)
+        self.ex = ex_class({"enableRateLimit": True})
+
+    def fetch_ohlcv(self, symbol: str, timeframe: str = DEFAULT_TIMEFRAME, limit: int = 200) -> pd.DataFrame:
+        ohlcv = self.ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+        return df
+
+    def fetch_last_price(self, symbol: str) -> float:
+        t = self.ex.fetch_ticker(symbol)
+        return float(t["last"]) if t.get("last") is not None else float(t["close"])
+
+
+async def http_get_json(url: str, timeout: int = 15) -> Dict[str, Any]:
+    # lightweight HTTP using aiohttp if available; fallback to urllib
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=timeout) as resp:
+                return await resp.json()
+    except Exception:
+        import urllib.request
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            raw = r.read().decode("utf-8")
+            return json.loads(raw)
+
+
+class TwelveData:
+    """
+    Optional provider for stocks/forex/gold via TWELVEDATA_API_KEY.
+    You can use symbols like: TSLA, AAPL, XAU/USD, EUR/USD
+    Docs are on TwelveData website (user supplies key).
+    """
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    @staticmethod
+    def normalize_symbol(sym: str) -> str:
+        s = sym.upper().strip().replace(" ", "")
+        # allow XAUUSD -> XAU/USD for TwelveData
+        if s == "XAUUSD":
+            return "XAU/USD"
+        if len(s) == 6 and s.isalpha():  # EURUSD -> EUR/USD
+            return f"{s[:3]}/{s[3:]}"
+        return s
+
+    async def fetch_last_price(self, symbol: str) -> Tuple[Optional[float], Optional[str]]:
+        s = self.normalize_symbol(symbol)
+        url = f"https://api.twelvedata.com/price?symbol={s}&apikey={self.api_key}"
+        data = await http_get_json(url)
+        if "price" in data:
+            return float(data["price"]), s
+        return None, data.get("message", "No price")
+
+    async def fetch_ohlcv(self, symbol: str, interval: str = "15min", outputsize: int = 200) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+        s = self.normalize_symbol(symbol)
+        url = (
+            f"https://api.twelvedata.com/time_series?"
+            f"symbol={s}&interval={interval}&outputsize={outputsize}&apikey={self.api_key}"
+            f"&format=JSON"
+        )
+        data = await http_get_json(url)
+        if "values" not in data:
+            return None, data.get("message", "No data")
+        vals = data["values"]
+        df = pd.DataFrame(vals)
+        # TwelveData returns strings
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.sort_values("datetime")
+        df.rename(columns={"datetime": "ts"}, inplace=True)
+        for c in ["open", "high", "low", "close", "volume"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            else:
+                df[c] = np.nan
+        return df[["ts", "open", "high", "low", "close", "volume"]], None
+
+
+# -----------------------------
+# Indicators / Strategy
+# -----------------------------
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
-    gain = (delta.where(delta > 0, 0.0)).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
-    rs = gain / (loss.replace(0, np.nan))
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    ma_up = up.ewm(alpha=1 / period, adjust=False).mean()
+    ma_down = down.ewm(alpha=1 / period, adjust=False).mean()
+    rs = ma_up / (ma_down + 1e-12)
     return 100 - (100 / (1 + rs))
+
+
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high = df["high"]
     low = df["low"]
     close = df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+    tr = pd.concat(
+        [
+            (high - low),
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
 
-# =========================
-# Exchange / Market data
-# =========================
-def get_exchange(name: str, api_key: Optional[str] = None, api_secret: Optional[str] = None):
-    name = (name or "binance").lower()
-    if not hasattr(ccxt, name):
-        name = "binance"
-    ex_class = getattr(ccxt, name)
-    params = {"enableRateLimit": True}
-    if api_key and api_secret:
-        params.update({"apiKey": api_key, "secret": api_secret})
-    return ex_class(params)
 
-def fetch_ohlcv(symbol: str, exchange_name: str, timeframe: str = "15m", limit: int = 200) -> pd.DataFrame:
-    ex = get_exchange(exchange_name)
-    # CCXT symbols like BTC/USDT. For XAUUSD: not supported on many spot exchanges.
-    if symbol.upper() == "XAUUSD":
-        raise ValueError("XAUUSD not supported via spot CCXT in this demo. Use a broker/CFD feed later.")
-    ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    return df
-
-def fetch_live_price(symbol: str, exchange_name: str) -> float:
-    ex = get_exchange(exchange_name)
-    if symbol.upper() == "XAUUSD":
-        raise ValueError("XAUUSD not supported in this demo feed.")
-    t = ex.fetch_ticker(symbol)
-    return float(t["last"])
-
-# =========================
-# Chart generator
-# =========================
-def make_chart(df: pd.DataFrame, symbol: str) -> str:
-    # Simple price + EMA chart
-    df = df.copy()
-    df["ema20"] = ema(df["close"], 20)
-    df["ema50"] = ema(df["close"], 50)
-
-    fig = plt.figure(figsize=(10, 5))
-    plt.plot(df["ts"], df["close"], label="Close")
-    plt.plot(df["ts"], df["ema20"], label="EMA20")
-    plt.plot(df["ts"], df["ema50"], label="EMA50")
-    plt.title(f"{symbol} - 15m")
-    plt.xlabel("Time")
-    plt.ylabel("Price")
-    plt.legend()
-    plt.tight_layout()
-
-    out = f"/tmp/chart_{symbol.replace('/', '_')}.png"
-    fig.savefig(out, dpi=150)
-    plt.close(fig)
-    return out
-
-# =========================
-# Signal logic (realistic + numbers)
-# =========================
 @dataclass
 class Signal:
-    side: str  # BUY / SELL / WAIT
-    entry: Tuple[float, float]
+    side: str  # "BUY" or "SELL" or "NONE"
+    entry: float
     sl: float
     tp1: float
     tp2: float
@@ -153,440 +284,706 @@ class Signal:
     confidence: int
     reason: str
 
-def build_signal(df: pd.DataFrame) -> Signal:
+
+def generate_signal_from_df(df: pd.DataFrame) -> Signal:
+    # Basic robust signal: trend (EMA20/EMA50), momentum (RSI), volatility (ATR)
+    c = df["close"]
     df = df.copy()
-    df["ema20"] = ema(df["close"], 20)
-    df["ema50"] = ema(df["close"], 50)
-    df["rsi14"] = rsi(df["close"], 14)
+    df["ema20"] = ema(c, 20)
+    df["ema50"] = ema(c, 50)
+    df["rsi14"] = rsi(c, 14)
     df["atr14"] = atr(df, 14)
 
     last = df.iloc[-1]
-    price = float(last["close"])
-    e20 = float(last["ema20"])
-    e50 = float(last["ema50"])
-    r = float(last["rsi14"]) if not math.isnan(float(last["rsi14"])) else 50.0
-    a = float(last["atr14"]) if not math.isnan(float(last["atr14"])) else (price * 0.003)
+    entry = float(last["close"])
+    a = float(last["atr14"]) if not math.isnan(float(last["atr14"])) else max(entry * 0.005, 1e-6)
 
-    trend_up = e20 > e50
-    trend_down = e20 < e50
+    trend_up = last["ema20"] > last["ema50"]
+    trend_down = last["ema20"] < last["ema50"]
+    r = float(last["rsi14"])
 
-    # Entry zone near EMA20
-    zone_low = e20 * 0.998
-    zone_high = e20 * 1.002
-
-    # Basic logic:
-    # BUY if uptrend + RSI not overheated + price near EMA20
-    # SELL if downtrend + RSI not oversold + price near EMA20
-    side = "WAIT"
-    reason = []
+    # Confidence heuristic
     conf = 50
+    if trend_up:
+        conf += 15
+    if trend_down:
+        conf += 15
+    if r >= 55:
+        conf += 10
+    if r <= 45:
+        conf += 10
+    conf = int(max(0, min(95, conf)))
 
-    if trend_up and (45 <= r <= 70) and (zone_low <= price <= zone_high):
+    # Decision
+    side = "NONE"
+    reason_parts = []
+    if trend_up and r >= 52:
         side = "BUY"
-        reason.append("Uptrend (EMA20 > EMA50)")
-        reason.append("Price near EMA20 (pullback zone)")
-        reason.append(f"RSI={r:.1f} (not overheated)")
-        conf = 75
-    elif trend_down and (30 <= r <= 55) and (zone_low <= price <= zone_high):
+        reason_parts.append("الاتجاه صاعد (EMA20 فوق EMA50)")
+        reason_parts.append(f"الزخم إيجابي (RSI={r:.1f})")
+    elif trend_down and r <= 48:
         side = "SELL"
-        reason.append("Downtrend (EMA20 < EMA50)")
-        reason.append("Price near EMA20 (pullback zone)")
-        reason.append(f"RSI={r:.1f} (not oversold)")
-        conf = 72
+        reason_parts.append("الاتجاه هابط (EMA20 تحت EMA50)")
+        reason_parts.append(f"الزخم سلبي (RSI={r:.1f})")
     else:
-        # Explain why wait
-        if trend_up:
-            reason.append("Trend up لكن الدخول ليس في منطقة pullback")
-        elif trend_down:
-            reason.append("Trend down لكن الدخول ليس في منطقة pullback")
-        else:
-            reason.append("السوق جانبي (EMA20 قريب من EMA50)")
-        reason.append(f"RSI={r:.1f}")
-        conf = 55
+        reason_parts.append(f"سوق متذبذب/غير واضح (RSI={r:.1f})")
+        return Signal("NONE", entry, entry, entry, entry, 0.0, conf, " | ".join(reason_parts))
 
-    # Build levels using ATR
-    entry = (round(zone_low, 4), round(zone_high, 4))
+    # Risk model (ATR based)
     if side == "BUY":
-        sl = price - (1.5 * a)
-        tp1 = price + (2.0 * a)
-        tp2 = price + (3.2 * a)
-    elif side == "SELL":
-        sl = price + (1.5 * a)
-        tp1 = price - (2.0 * a)
-        tp2 = price - (3.2 * a)
+        sl = entry - 1.6 * a
+        tp1 = entry + 1.6 * a
+        tp2 = entry + 2.6 * a
+        rr = (tp1 - entry) / max(entry - sl, 1e-9)
     else:
-        sl = price - (1.5 * a)
-        tp1 = price + (2.0 * a)
-        tp2 = price + (3.2 * a)
+        sl = entry + 1.6 * a
+        tp1 = entry - 1.6 * a
+        tp2 = entry - 2.6 * a
+        rr = (entry - tp1) / max(sl - entry, 1e-9)
 
-    risk = abs(price - sl)
-    reward = abs(tp1 - price)
-    rr = (reward / risk) if risk > 0 else 0.0
+    reason_parts.append(f"تقلب (ATR)={a:.4f}")
+    return Signal(side, entry, sl, tp1, tp2, float(rr), conf, " | ".join(reason_parts))
 
-    return Signal(
-        side=side,
-        entry=(float(entry[0]), float(entry[1])),
-        sl=float(round(sl, 4)),
-        tp1=float(round(tp1, 4)),
-        tp2=float(round(tp2, 4)),
-        rr=float(round(rr, 2)),
-        confidence=int(conf),
-        reason="; ".join(reason),
-    )
 
-def format_signal(symbol: str, price: float, sig: Signal) -> str:
-    return (
-        f"🎯 SIGNAL - {symbol}\n\n"
-        f"💰 السعر الحالي: {price:.4f}\n"
-        f"📌 القرار: {sig.side}\n\n"
-        f"🎯 Entry Zone: {sig.entry[0]:.4f} - {sig.entry[1]:.4f}\n"
-        f"🛑 Stop Loss: {sig.sl:.4f}\n"
-        f"✅ TP1: {sig.tp1:.4f}\n"
-        f"✅ TP2: {sig.tp2:.4f}\n"
-        f"⚖️ R:R: {sig.rr}\n"
-        f"🤖 Confidence: {sig.confidence}%\n\n"
-        f"🧠 السبب: {sig.reason}\n\n"
-        f"⚠️ تنبيه: هذا تحليل تعليمي. لا يوجد ضمان ربح."
-    )
-
-# =========================
-# Trading (real execution) - spot only (no leverage)
-# =========================
-def calc_position_size(capital: float, risk_pct: float, entry_price: float, sl_price: float) -> float:
+def position_size(capital: float, risk_pct: float, entry: float, sl: float) -> Tuple[float, float]:
+    # returns (risk_amount, qty)
     risk_amount = capital * (risk_pct / 100.0)
-    per_unit_risk = abs(entry_price - sl_price)
+    per_unit_risk = abs(entry - sl)
     if per_unit_risk <= 0:
-        return 0.0
+        return risk_amount, 0.0
     qty = risk_amount / per_unit_risk
-    # For spot, qty is base amount (BTC). This is simplified.
-    return float(qty)
+    return risk_amount, qty
 
-async def place_order_real(user: Dict[str, Any], symbol: str, side: str, qty: float) -> str:
-    if not user.get("api_key") or not user.get("api_secret"):
-        return "❌ API Key/Secret غير موجود. ادخلهم من Settings."
-    ex = get_exchange(user["exchange"], user["api_key"], user["api_secret"])
-    # Market order (simple)
+
+# -----------------------------
+# Chart
+# -----------------------------
+def make_chart(df: pd.DataFrame, title: str) -> bytes:
+    df = df.copy()
+    df = df.tail(120)
+    x = df["ts"]
+    c = df["close"]
+    e20 = ema(c, 20)
+    e50 = ema(c, 50)
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(x, c, label="Close")
+    plt.plot(x, e20, label="EMA20")
+    plt.plot(x, e50, label="EMA50")
+    plt.title(title)
+    plt.xlabel("Time")
+    plt.ylabel("Price")
+    plt.legend()
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=160)
+    plt.close()
+    buf.seek(0)
+    return buf.read()
+
+
+# -----------------------------
+# Optional AI
+# -----------------------------
+def ai_client() -> Optional["OpenAI"]:
+    if not OPENAI_AVAILABLE:
+        return None
+    if not OPENAI_API_KEY:
+        return None
     try:
+        return OpenAI(api_key=OPENAI_API_KEY)
+    except Exception:
+        return None
+
+
+async def ai_explain(symbol: str, signal: Signal, last_price: float, extra: str = "") -> Optional[str]:
+    client = ai_client()
+    if client is None:
+        return None
+    prompt = f"""
+أنت محلل أسواق محترف. اكتب شرحاً عملياً وقصيراً (عربي تونسي/فصحى بسيط) للإشارة التالية بدون مبالغة.
+الرمز: {symbol}
+السعر الحالي: {last_price}
+الإشارة: {signal.side}
+Entry: {signal.entry}
+SL: {signal.sl}
+TP1: {signal.tp1}
+TP2: {signal.tp2}
+RR: {signal.rr:.2f}
+Confidence: {signal.confidence}/100
+الأسباب: {signal.reason}
+{extra}
+
+طلبي:
+- أعطني "خطة تنفيذ" واضحة: أين ندخل، أين نخرج، ومتى نلغي الفكرة
+- أعطني تحذير مخاطر محترم
+- لا تعطي وعود ربح
+"""
+    try:
+        # Official python usage uses Responses API 1
+        resp = client.responses.create(
+            model=OPENAI_MODEL,
+            input=prompt,
+        )
+        return getattr(resp, "output_text", None) or None
+    except Exception as e:
+        log.warning("AI error: %s", e)
+        return None
+
+
+# -----------------------------
+# Live Trading (optional)
+# -----------------------------
+class LiveTrader:
+    def __init__(self):
+        self.enabled = bool(BINANCE_API_KEY and BINANCE_API_SECRET)
+        self.ex = ccxt.binance({
+            "apiKey": BINANCE_API_KEY,
+            "secret": BINANCE_API_SECRET,
+            "enableRateLimit": True,
+            "options": {"defaultType": "spot"},
+        })
+
+    def can_trade(self) -> bool:
+        return self.enabled
+
+    def market_order(self, symbol: str, side: str, amount: float) -> Dict[str, Any]:
+        # Spot market order only. No leverage.
         if side == "BUY":
-            o = ex.create_market_buy_order(symbol, qty)
-        elif side == "SELL":
-            o = ex.create_market_sell_order(symbol, qty)
+            return self.ex.create_market_buy_order(symbol, amount)
         else:
-            return "❌ لا يوجد أمر."
-        oid = o.get("id", "ok")
-        return f"✅ تم تنفيذ أمر {side} (Market) | qty={qty:.6f} | id={oid}"
-    except Exception as e:
-        return f"❌ فشل التنفيذ: {str(e)}"
+            return self.ex.create_market_sell_order(symbol, amount)
 
-# =========================
-# Minimal AI explainer (works without OpenAI too)
-# =========================
-async def ai_explain(text: str) -> str:
-    # If you later want real OpenAI calls, we add them safely.
-    # For now: always return helpful explanation without needing credit.
-    return (
-        "🧠 تفسير سريع (Smart):\n"
-        "- هذا القرار مبني على اتجاه EMA + منطقة Pullback + RSI.\n"
-        "- الأفضل تنفذ فقط لما السعر يدخل Entry Zone.\n"
-        "- لا ترفع المخاطرة فوق 1-2%.\n"
-        "- إذا السوق سريع بزاف: خفف حجم الصفقة.\n\n"
-        "إذا تحب، نزيدك Plan دخول/خروج خطوة بخطوة حسب نفس الرمز."
-    )
 
-# =========================
-# UI / Keyboards
-# =========================
-def main_kb(chat_id: int) -> InlineKeyboardMarkup:
-    user = uget(chat_id)
-    auto = "✅ Auto ON" if user["auto_on"] else "🤖 Auto OFF"
-    paper = "✅ Paper ON" if user["paper_on"] else "🧾 Paper OFF"
-    rows = [
-        [InlineKeyboardButton("📊 Analysis", callback_data="mode:analysis"),
-         InlineKeyboardButton("🎯 Signal", callback_data="mode:signal")],
-        [InlineKeyboardButton(auto, callback_data="toggle:auto"),
-         InlineKeyboardButton(paper, callback_data="toggle:paper")],
-        [InlineKeyboardButton("⚙️ Settings", callback_data="mode:settings"),
-         InlineKeyboardButton("💬 Chat", callback_data="mode:chat")],
-    ]
-    return InlineKeyboardMarkup(rows)
-
-def settings_kb() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("🏦 Exchange", callback_data="set:exchange"),
-         InlineKeyboardButton("🔑 API Key/Secret", callback_data="set:api")],
-        [InlineKeyboardButton("💰 Capital", callback_data="set:capital"),
-         InlineKeyboardButton("⚖️ Risk %", callback_data="set:risk")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="back:main")],
-    ]
-    return InlineKeyboardMarkup(rows)
-
-# =========================
-# Handlers
-# =========================
+# -----------------------------
+# Telegram Handlers
+# -----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    u = uget(chat_id)
+    context.user_data.setdefault(STATE_KEY, STATE_NONE)
+    context.user_data.setdefault(UD_RISK, DEFAULT_RISK_PCT)
+    context.user_data.setdefault(UD_AI, True)  # AI is optional, will fallback if no key
+    context.user_data.setdefault(UD_AUTO_PAPER, False)
+    context.user_data.setdefault(UD_AUTO_LIVE, False)
+    context.user_data.setdefault(UD_POSITIONS, {})
+    context.user_data.setdefault(UD_CONFIRM_LIVE, 0)
+
     text = (
-        "🤖 Smart Trading Bot (Realistic)\n\n"
-        "اختر وضع:\n"
-        "- Analysis: تحليل مع رسم + مستويات\n"
-        "- Signal: إشارة بأرقام Entry/SL/TP + ثقة\n"
-        "- Auto: تنفيذ حقيقي (يحتاج API) أو Paper\n\n"
-        "ارسل رمز مثل: BTC/USDT أو ETH/USDT\n"
-        "ملاحظة: XAUUSD سنضيف له مزود بيانات لاحقا."
+        "🤖 *Smart Trading Bot*\n\n"
+        "اختر من الأزرار:\n"
+        "📊 تحليل = تحليل + شارت\n"
+        "🎯 إشارة = Entry/SL/TP + خطة\n"
+        "🤖 Auto Paper = محاكاة تلقائية\n"
+        "⚡ Auto Live = تداول حقيقي (اختياري + مفاتيح منصة)\n"
+        "🧠 دردشة = ذكاء اصطناعي (اختياري)\n\n"
+        "ملاحظة: *لا رافعة* افتراضياً، والتداول الحقيقي OFF حتى تأكد.\n"
     )
-    await update.message.reply_text(text, reply_markup=main_kb(chat_id))
+    await update.message.reply_text(text, reply_markup=MAIN_KB, parse_mode=ParseMode.MARKDOWN)
 
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
 
-    chat_id = query.message.chat.id
-    user = uget(chat_id)
-    data = query.data
+async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    risk = context.user_data.get(UD_RISK, DEFAULT_RISK_PCT)
+    ai_on = context.user_data.get(UD_AI, True)
+    paper_on = context.user_data.get(UD_AUTO_PAPER, False)
+    live_on = context.user_data.get(UD_AUTO_LIVE, False)
 
-    if data.startswith("mode:"):
-        user["mode"] = data.split(":", 1)[1]
-        if user["mode"] == "settings":
-            await query.edit_message_text("⚙️ Settings:", reply_markup=settings_kb())
-        else:
-            await query.edit_message_text(
-                f"✅ تم اختيار: {user['mode'].upper()}\nارسل الرمز مثل BTC/USDT",
-                reply_markup=main_kb(chat_id),
-            )
+    td = "✅" if TWELVEDATA_API_KEY else "❌"
+    ai = "✅" if (OPENAI_API_KEY and OPENAI_AVAILABLE) else "❌"
+    bn = "✅" if (BINANCE_API_KEY and BINANCE_API_SECRET) else "❌"
+
+    msg = (
+        "⚙️ *الإعدادات*\n\n"
+        f"- Risk per trade: *{risk}%*\n"
+        f"- AI Enabled: *{ai_on}* (OpenAI key: {ai})\n"
+        f"- TwelveData key (Stocks/Gold): {td}\n"
+        f"- Binance keys (Live Trading): {bn}\n"
+        f"- Auto Paper: *{paper_on}*\n"
+        f"- Auto Live: *{live_on}*\n\n"
+        "أوامر مفيدة:\n"
+        "`/risk 1.0`  (مثال)\n"
+        "`/capital 1000`\n"
+        "`/ai on` أو `/ai off`\n"
+        "`/auto_paper on` أو `/auto_paper off`\n"
+        "`/auto_live on` أو `/auto_live off`\n"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("اكتب: /risk 1.0")
         return
-
-    if data == "toggle:auto":
-        user["auto_on"] = not user["auto_on"]
-        await query.edit_message_reply_markup(reply_markup=main_kb(chat_id))
+    val = safe_float(context.args[0])
+    if val is None or val <= 0 or val > 10:
+        await update.message.reply_text("حط رقم بين 0.1 و 10")
         return
+    context.user_data[UD_RISK] = float(val)
+    await update.message.reply_text(f"✅ تم: Risk = {val}%")
 
-    if data == "toggle:paper":
-        user["paper_on"] = not user["paper_on"]
-        await query.edit_message_reply_markup(reply_markup=main_kb(chat_id))
+
+async def cmd_capital(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("اكتب: /capital 1000")
         return
-
-    if data == "back:main":
-        await query.edit_message_text("✅ رجعنا للقائمة.", reply_markup=main_kb(chat_id))
+    val = safe_float(context.args[0])
+    if val is None or val <= 0:
+        await update.message.reply_text("حط رقم صحيح > 0")
         return
+    context.user_data[UD_CAPITAL] = float(val)
+    await update.message.reply_text(f"✅ تم حفظ رأس المال: {val}")
 
-    # settings actions
-    if data == "set:exchange":
-        user["pending"] = "exchange"
-        await query.edit_message_text(
-            "🏦 اكتب اسم المنصة (binance / bybit / okx / kucoin ...):",
-            reply_markup=settings_kb(),
-        )
+
+async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("اكتب: /ai on أو /ai off")
         return
+    v = context.args[0].lower()
+    if v in ("on", "yes", "1", "true"):
+        context.user_data[UD_AI] = True
+        await update.message.reply_text("✅ AI ON (إذا المفتاح موجود)")
+    elif v in ("off", "no", "0", "false"):
+        context.user_data[UD_AI] = False
+        await update.message.reply_text("✅ AI OFF")
+    else:
+        await update.message.reply_text("اكتب: /ai on أو /ai off")
 
-    if data == "set:api":
-        user["pending"] = "api"
-        await query.edit_message_text(
-            "🔑 ارسل هكذا في رسالة واحدة:\nAPI_KEY,API_SECRET\n\n"
-            "⚠️ عطّل Withdraw من المنصة.",
-            reply_markup=settings_kb(),
-        )
+
+async def cmd_auto_paper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("اكتب: /auto_paper on أو /auto_paper off")
         return
+    v = context.args[0].lower()
+    if v in ("on", "1", "true", "yes"):
+        context.user_data[UD_AUTO_PAPER] = True
+        await update.message.reply_text("✅ Auto Paper ON")
+    else:
+        context.user_data[UD_AUTO_PAPER] = False
+        await update.message.reply_text("✅ Auto Paper OFF")
 
-    if data == "set:capital":
-        user["pending"] = "capital"
-        await query.edit_message_text("💰 اكتب رأس المال (مثلا 1000):", reply_markup=settings_kb())
+
+async def cmd_auto_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("اكتب: /auto_live on أو /auto_live off")
         return
-
-    if data == "set:risk":
-        user["pending"] = "risk"
-        await query.edit_message_text("⚖️ اكتب نسبة المخاطرة % (مثلا 1 أو 2):", reply_markup=settings_kb())
-        return
-
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user = uget(chat_id)
-    msg = (update.message.text or "").strip()
-
-    # Settings input
-    if user.get("pending"):
-        p = user["pending"]
-        user["pending"] = None
-
-        if p == "exchange":
-            user["exchange"] = msg.lower()
-            await update.message.reply_text(f"✅ تم ضبط Exchange: {user['exchange']}", reply_markup=main_kb(chat_id))
+    v = context.args[0].lower()
+    trader = LiveTrader()
+    if v in ("on", "1", "true", "yes"):
+        if not trader.can_trade():
+            await update.message.reply_text("❌ ما فماش BINANCE_API_KEY و BINANCE_API_SECRET في ENV.")
             return
-
-        if p == "api":
-            try:
-                k, s = [x.strip() for x in msg.split(",", 1)]
-                user["api_key"] = k
-                user["api_secret"] = s
-                await update.message.reply_text("✅ تم حفظ API. (تأكد Withdraw OFF)", reply_markup=main_kb(chat_id))
-            except:
-                await update.message.reply_text("❌ صيغة خاطئة. ارسل: API_KEY,API_SECRET", reply_markup=main_kb(chat_id))
-            return
-
-        if p == "capital":
-            try:
-                user["capital"] = float(msg)
-                await update.message.reply_text(f"✅ Capital: {user['capital']}", reply_markup=main_kb(chat_id))
-            except:
-                await update.message.reply_text("❌ اكتب رقم فقط.", reply_markup=main_kb(chat_id))
-            return
-
-        if p == "risk":
-            try:
-                user["risk_pct"] = float(msg)
-                await update.message.reply_text(f"✅ Risk%: {user['risk_pct']}", reply_markup=main_kb(chat_id))
-            except:
-                await update.message.reply_text("❌ اكتب رقم فقط.", reply_markup=main_kb(chat_id))
-            return
-
-    # Normal flow: treat as symbol or chat
-    # Accept forms: BTC or BTC/USDT
-    symbol = msg.upper().replace(" ", "")
-    if "/" not in symbol and symbol.isalnum():
-        # default quote
-        symbol = f"{symbol}/USDT"
-
-    user["symbol"] = symbol
-
-    # Run according to mode
-    mode = user["mode"]
-
-    # XAUUSD note
-    if symbol == "XAUUSD":
+        # require 2-step confirmation
+        context.user_data[UD_CONFIRM_LIVE] = 1
         await update.message.reply_text(
-            "⚠️ XAUUSD يحتاج مزود بيانات (Broker/CFD). حاليا هذا البوت يدعم Spot Crypto عبر CCXT.\n"
-            "نضيف الذهب لاحقا بمزود صحيح.",
-            reply_markup=main_kb(chat_id),
+            "⚠️ *تداول حقيقي*.\n"
+            "اكتب بالضبط: `CONFIRM LIVE`\n"
+            "باش نفعّلو Auto Live.\n\n"
+            "ملاحظة: بدون رافعة، Spot فقط.",
+            parse_mode=ParseMode.MARKDOWN
         )
-        return
+    else:
+        context.user_data[UD_AUTO_LIVE] = False
+        context.user_data[UD_CONFIRM_LIVE] = 0
+        await update.message.reply_text("✅ Auto Live OFF")
 
-    try:
-        df = fetch_ohlcv(symbol, user["exchange"], timeframe="15m", limit=220)
-        live = fetch_live_price(symbol, user["exchange"])
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطأ جلب البيانات: {str(e)}", reply_markup=main_kb(chat_id))
-        return
 
-    sig = build_signal(df)
+async def analysis_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data[STATE_KEY] = STATE_WAIT_SYMBOL_ANALYSIS
+    await update.message.reply_text("📊 أرسل الرمز الآن (مثال: BTC أو BTCUSDT أو TSLA أو XAUUSD)")
 
-    if mode == "analysis":
-        chart_path = make_chart(df.tail(200), symbol)
-        text = (
-            f"📊 Analysis - {symbol}\n\n"
-            f"💰 السعر الحالي: {live:.4f}\n"
-            f"📌 الاتجاه (تقريبا): {'صاعد' if ema(df['close'],20).iloc[-1] > ema(df['close'],50).iloc[-1] else 'هابط/جانبي'}\n"
-            f"🤖 خلاصة: {sig.side} | ثقة {sig.confidence}%\n\n"
-            f"🎯 Zone: {sig.entry[0]:.4f} - {sig.entry[1]:.4f}\n"
-            f"🛑 SL: {sig.sl:.4f}\n"
-            f"✅ TP1: {sig.tp1:.4f}\n"
-            f"✅ TP2: {sig.tp2:.4f}\n"
+
+async def signal_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data[STATE_KEY] = STATE_WAIT_SYMBOL_SIGNAL
+    await update.message.reply_text("🎯 أرسل الرمز الآن (مثال: BTC أو BTCUSDT أو TSLA أو XAUUSD)")
+
+
+async def chat_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data[STATE_KEY] = STATE_WAIT_CHAT
+    await update.message.reply_text("🧠 اكتب سؤالك (سأرد AI إذا المفتاح موجود، وإلا رد عادي).")
+
+
+async def whales_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🐋 Whales: هذه ميزة تحتاج WhaleAlert API Key. (نزيدوها بعد)")
+
+
+async def scan_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data[STATE_KEY] = STATE_WAIT_SYMBOL_SCAN
+    await update.message.reply_text("🧾 Scan: أرسل رمز Crypto (مثال BTC) ونعطيك Quick Scan.")
+
+
+async def auto_paper_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    on = context.user_data.get(UD_AUTO_PAPER, False)
+    context.user_data[UD_AUTO_PAPER] = not on
+    await update.message.reply_text(f"🤖 Auto Paper = {context.user_data[UD_AUTO_PAPER]}")
+
+
+async def auto_live_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # guide user to /auto_live on flow
+    await update.message.reply_text("⚡ لتفعيل Auto Live: اكتب /auto_live on (لازم مفاتيح Binance في ENV)")
+
+
+# -----------------------------
+# Core actions
+# -----------------------------
+async def get_market_df_and_price(symbol_raw: str) -> Tuple[str, str, Optional[pd.DataFrame], Optional[float], Optional[str]]:
+    """
+    returns: (market_type, normalized_symbol, df, last_price, error)
+    market_type: crypto | twelvedata
+    """
+    sym = symbol_raw.strip()
+
+    # Crypto path (default)
+    if is_crypto_symbol(sym):
+        try:
+            crypto = CryptoData()
+            symbol = normalize_crypto_symbol(sym)
+            df = crypto.fetch_ohlcv(symbol, timeframe=DEFAULT_TIMEFRAME, limit=200)
+            price = float(df["close"].iloc[-1])
+            return "crypto", symbol, df, price, None
+        except Exception as e:
+            return "crypto", normalize_crypto_symbol(sym), None, None, f"خطأ Crypto data: {e}"
+
+    # Non-crypto path via TwelveData
+    if not TWELVEDATA_API_KEY:
+        return "twelvedata", sym.upper(), None, None, "لا يوجد TWELVEDATA_API_KEY للأسهم/الذهب حالياً."
+    td = TwelveData(TWELVEDATA_API_KEY)
+    norm = td.normalize_symbol(sym)
+    df, err = await td.fetch_ohlcv(norm, interval="15min", outputsize=200)
+    if err:
+        price, err2 = await td.fetch_last_price(norm)
+        if price is not None:
+            return "twelvedata", norm, None, price, None
+        return "twelvedata", norm, None, None, err or err2
+    price = float(df["close"].iloc[-1])
+    return "twelvedata", norm, df, price, None
+
+
+def format_signal_text(symbol: str, price: float, sig: Signal, capital: Optional[float], risk_pct: float) -> str:
+    if sig.side == "NONE":
+        return (
+            f"🎯 *Signal* — {symbol}\n"
+            f"السعر: *{human_money(price)}*\n\n"
+            "❌ *لا توجد فرصة واضحة الآن* (سوق متذبذب/غير واضح).\n"
+            f"سبب مختصر: {sig.reason}\n"
         )
-        await update.message.reply_photo(photo=open(chart_path, "rb"), caption=text)
-        exp = await ai_explain(text)
-        await update.message.reply_text(exp, reply_markup=main_kb(chat_id))
-        return
 
-    if mode == "signal":
-        text = format_signal(symbol, live, sig)
-        await update.message.reply_text(text, reply_markup=main_kb(chat_id))
-
-        # Paper/Auto execution (ONLY if side BUY/SELL and price inside entry zone)
-        inside = (sig.entry[0] <= live <= sig.entry[1])
-        if sig.side in ["BUY", "SELL"] and inside and (user["paper_on"] or user["auto_on"]):
-            # position size
-            qty = calc_position_size(user["capital"], user["risk_pct"], live, sig.sl)
-            if qty <= 0:
-                await update.message.reply_text("❌ حجم الصفقة صفر. راجع Capital/Risk.", reply_markup=main_kb(chat_id))
-                return
-
-            if user["paper_on"] and not user["auto_on"]:
-                await update.message.reply_text(
-                    f"🧾 PAPER EXECUTED: {sig.side} {symbol}\nqty={qty:.6f}\n"
-                    f"Entry~{live:.4f} | SL={sig.sl:.4f} | TP1={sig.tp1:.4f}",
-                    reply_markup=main_kb(chat_id),
-                )
-                return
-
-            if user["auto_on"]:
-                res = await place_order_real(user, symbol, sig.side, qty)
-                await update.message.reply_text(res, reply_markup=main_kb(chat_id))
-                return
-        return
-
-    # chat mode: helpful answer
-    await update.message.reply_text(
-        "💬 اكتب الرمز (BTC/USDT) ثم اختر Analysis أو Signal.\n"
-        "إذا تحب Auto Trading: ادخل API من Settings ثم Auto ON.",
-        reply_markup=main_kb(chat_id),
+    rr = sig.rr
+    txt = (
+        f"🎯 *Signal* — {symbol}\n"
+        f"السعر: *{human_money(price)}*\n\n"
+        f"*Side:* `{sig.side}`\n"
+        f"*Entry:* `{human_money(sig.entry)}`\n"
+        f"*SL:* `{human_money(sig.sl)}`\n"
+        f"*TP1:* `{human_money(sig.tp1)}`\n"
+        f"*TP2:* `{human_money(sig.tp2)}`\n"
+        f"*RR (تقريباً):* `{rr:.2f}`\n"
+        f"*Confidence:* `{sig.confidence}/100`\n\n"
+        f"*Why:* {sig.reason}\n"
     )
 
-# =========================
-# Auto scanner loop (optional)
-# =========================
-async def auto_loop(app: Application):
-    while True:
-        try:
-            for chat_id, user in list(USERS.items()):
-                if not user.get("paper_on") and not user.get("auto_on"):
-                    continue
+    if capital:
+        risk_amount, qty = position_size(capital, risk_pct, sig.entry, sig.sl)
+        txt += (
+            "\n*📦 Risk Management*\n"
+            f"- Capital: `{human_money(capital)}`\n"
+            f"- Risk: `{risk_pct}%` => `{human_money(risk_amount)}`\n"
+            f"- Position size (تقريب): `{human_money(qty)}` وحدات\n"
+        )
 
-                # throttle
-                if time.time() - user.get("last_signal_ts", 0) < 60:
-                    continue
+    txt += "\n⚠️ *تنبيه:* هذا محتوى تعليمي وليس نصيحة مالية."
+    return txt
 
-                watch = DEFAULT_WATCHLIST
-                ex = user.get("exchange", DEFAULT_EXCHANGE)
 
-                for sym in watch:
-                    if sym == "XAUUSD":
-                        continue
-                    try:
-                        df = fetch_ohlcv(sym, ex, timeframe="15m", limit=220)
-                        live = fetch_live_price(sym, ex)
-                        sig = build_signal(df)
-                        inside = (sig.entry[0] <= live <= sig.entry[1])
+async def do_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol_raw: str):
+    market, symbol, df, price, err = await get_market_df_and_price(symbol_raw)
+    if err:
+        await update.message.reply_text(f"❌ {err}")
+        return
 
-                        if sig.side in ["BUY", "SELL"] and sig.confidence >= 70 and inside:
-                            user["last_signal_ts"] = time.time()
-                            text = "🚨 Auto فرصة قوية\n\n" + format_signal(sym, live, sig)
-                            await app.bot.send_message(chat_id=chat_id, text=text)
+    risk_pct = float(context.user_data.get(UD_RISK, DEFAULT_RISK_PCT))
+    capital = context.user_data.get(UD_CAPITAL)
 
-                            # paper or real
-                            qty = calc_position_size(user["capital"], user["risk_pct"], live, sig.sl)
-                            if user["auto_on"]:
-                                res = await place_order_real(user, sym, sig.side, qty)
-                                await app.bot.send_message(chat_id=chat_id, text=res)
-                            else:
-                                await app.bot.send_message(
-                                    chat_id=chat_id,
-                                    text=f"🧾 PAPER EXECUTED: {sig.side} {sym} qty={qty:.6f}",
-                                )
-                            break
-                    except:
-                        continue
-        except:
-            pass
+    # If we have df -> signal + chart; else -> price only
+    if df is not None and len(df) >= 50:
+        sig = generate_signal_from_df(df)
+        chart_bytes = make_chart(df, f"{symbol} ({market})")
+        await update.message.reply_photo(
+            photo=chart_bytes,
+            caption=f"📊 {symbol}\nالسعر: {human_money(price)}",
+        )
 
-        await asyncio.sleep(10)
+        msg = format_signal_text(symbol, price, sig, capital, risk_pct)
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
-# =========================
+        # Optional AI explanation
+        if context.user_data.get(UD_AI, True):
+            ai_txt = await ai_explain(symbol, sig, price)
+            if ai_txt:
+                await update.message.reply_text("🧠 *AI خطة مختصرة:*\n" + ai_txt, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(f"📊 {symbol}\nالسعر الحالي: {human_money(price)}\n(لا يوجد OHLCV كافي للشارت هنا)")
+
+
+async def do_signal(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol_raw: str):
+    market, symbol, df, price, err = await get_market_df_and_price(symbol_raw)
+    if err:
+        await update.message.reply_text(f"❌ {err}")
+        return
+
+    risk_pct = float(context.user_data.get(UD_RISK, DEFAULT_RISK_PCT))
+    capital = context.user_data.get(UD_CAPITAL)
+
+    if df is None or len(df) < 50:
+        await update.message.reply_text(f"🎯 {symbol}\nالسعر: {human_money(price)}\n(ما نجمش نخرّج Signal بدون بيانات كافية)")
+        return
+
+    sig = generate_signal_from_df(df)
+    msg = format_signal_text(symbol, price, sig, capital, risk_pct)
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+    if context.user_data.get(UD_AI, True):
+        ai_txt = await ai_explain(symbol, sig, price)
+        if ai_txt:
+            await update.message.reply_text("🧠 *AI Explanation:*\n" + ai_txt, parse_mode=ParseMode.MARKDOWN)
+
+
+async def do_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol_raw: str):
+    market, symbol, df, price, err = await get_market_df_and_price(symbol_raw)
+    if err:
+        await update.message.reply_text(f"❌ {err}")
+        return
+    if df is None or len(df) < 50:
+        await update.message.reply_text(f"🧾 Scan {symbol}\nالسعر: {human_money(price)}\n(بيانات غير كافية)")
+        return
+
+    c = df["close"]
+    r = float(rsi(c, 14).iloc[-1])
+    e20 = float(ema(c, 20).iloc[-1])
+    e50 = float(ema(c, 50).iloc[-1])
+
+    bias = "صاعد ✅" if e20 > e50 else "هابط ❌"
+    msg = (
+        f"🧾 *Quick Scan* — {symbol}\n"
+        f"- Price: `{human_money(price)}`\n"
+        f"- Trend: *{bias}*\n"
+        f"- RSI(14): `{r:.1f}`\n\n"
+        "ملاحظة: إذا RSI فوق 70 ممكن Overbought، وإذا تحت 30 Oversold."
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+# -----------------------------
+# Auto Paper / Auto Live Loops
+# -----------------------------
+async def auto_loop(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    chat_id = job.chat_id
+    data = job.data  # dict with user_id
+    user_id = data["user_id"]
+
+    # PTB stores user_data per user_id
+    ud = context.application.user_data.get(user_id, {})
+    symbol = ud.get(UD_SYMBOL)
+    if not symbol:
+        return
+
+    paper_on = ud.get(UD_AUTO_PAPER, False)
+    live_on = ud.get(UD_AUTO_LIVE, False)
+
+    if not paper_on and not live_on:
+        return
+
+    # Only crypto live trading in this version (safest)
+    try:
+        market, sym, df, price, err = await get_market_df_and_price(symbol)
+        if err or df is None:
+            return
+        sig = generate_signal_from_df(df)
+
+        # Paper engine
+        positions: Dict[str, Any] = ud.get(UD_POSITIONS, {})
+        pos = positions.get(sym)
+
+        # Simple paper rules: open if NONE->signal BUY/SELL, close if opposite signal
+        action_msgs = []
+
+        if paper_on:
+            if pos is None and sig.side in ("BUY", "SELL"):
+                positions[sym] = {
+                    "side": sig.side,
+                    "entry": sig.entry,
+                    "ts": now_ts(),
+                }
+                action_msgs.append(f"🤖 *PAPER OPEN* {sym} `{sig.side}` @ `{human_money(sig.entry)}`")
+            elif pos is not None:
+                if sig.side != "NONE" and sig.side != pos["side"]:
+                    action_msgs.append(
+                        f"🤖 *PAPER CLOSE* {sym} (كانت {pos['side']}) | الآن Signal={sig.side} | Price=`{human_money(price)}`"
+                    )
+                    positions.pop(sym, None)
+
+            ud[UD_POSITIONS] = positions
+
+        # Live engine (optional) — guarded
+        if live_on:
+            trader = LiveTrader()
+            if trader.can_trade() and market == "crypto":
+                # Minimal safety: trade only when signal BUY/SELL and no existing live position tracking.
+                # NOTE: This is a starter template; real position tracking needs exchange balance + open orders handling.
+                live_pos = ud.get("live_pos")
+                capital = ud.get(UD_CAPITAL, None)
+                risk_pct = float(ud.get(UD_RISK, DEFAULT_RISK_PCT))
+
+                if live_pos is None and sig.side in ("BUY", "SELL") and capital:
+                    # Approx qty by risk model (still simplistic)
+                    risk_amount, qty = position_size(float(capital), risk_pct, sig.entry, sig.sl)
+                    # Convert qty to base units; for spot we buy base asset qty.
+                    qty = max(qty, 0.0)
+                    # Clamp small qty
+                    qty = float(qty)
+
+                    if qty > 0:
+                        try:
+                            order = trader.market_order(sym, sig.side, qty)
+                            ud["live_pos"] = {"side": sig.side, "qty": qty, "order": order, "ts": now_ts()}
+                            action_msgs.append(f"⚡ *LIVE ORDER* {sym} `{sig.side}` qty=`{human_money(qty)}` ✅")
+                        except Exception as e:
+                            action_msgs.append(f"⚡ *LIVE ERROR* {e}")
+
+        # Send updates if any
+        if action_msgs:
+            await context.bot.send_message(chat_id=chat_id, text="\n".join(action_msgs), parse_mode=ParseMode.MARKDOWN)
+
+    except Exception as e:
+        log.warning("auto_loop error: %s", e)
+
+
+def ensure_auto_job(app: Application, chat_id: int, user_id: int):
+    # one repeating job per chat_id
+    name = f"auto_{chat_id}"
+    for j in app.job_queue.jobs():
+        if j.name == name:
+            return
+    app.job_queue.run_repeating(
+        auto_loop,
+        interval=AUTO_INTERVAL_SEC,
+        first=10,
+        chat_id=chat_id,
+        name=name,
+        data={"user_id": user_id},
+    )
+
+
+# -----------------------------
+# Message router
+# -----------------------------
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+
+    # Live confirm step
+    if context.user_data.get(UD_CONFIRM_LIVE, 0) == 1:
+        if text.upper() == "CONFIRM LIVE":
+            context.user_data[UD_AUTO_LIVE] = True
+            context.user_data[UD_CONFIRM_LIVE] = 0
+            context.user_data[UD_SYMBOL] = context.user_data.get(UD_SYMBOL)  # keep
+            ensure_auto_job(context.application, update.effective_chat.id, update.effective_user.id)
+            await update.message.reply_text("✅ تم تفعيل Auto Live. (Spot فقط / بدون رافعة)")
+            return
+        else:
+            await update.message.reply_text("اكتب بالضبط: CONFIRM LIVE أو ألغي بـ /auto_live off")
+            return
+
+    # Buttons
+    if text == "📊 تحليل":
+        await analysis_btn(update, context); return
+    if text == "🎯 إشارة":
+        await signal_btn(update, context); return
+    if text == "🧠 دردشة":
+        await chat_btn(update, context); return
+    if text == "⚙️ إعدادات":
+        await settings(update, context); return
+    if text == "🐋 Whales":
+        await whales_btn(update, context); return
+    if text == "🧾 Scan":
+        await scan_btn(update, context); return
+    if text == "🤖 Auto Paper":
+        await auto_paper_btn(update, context)
+        ensure_auto_job(context.application, update.effective_chat.id, update.effective_user.id)
+        return
+    if text == "⚡ Auto Live":
+        await auto_live_btn(update, context); return
+
+    state = context.user_data.get(STATE_KEY, STATE_NONE)
+
+    # State actions
+    if state == STATE_WAIT_SYMBOL_ANALYSIS:
+        context.user_data[UD_SYMBOL] = text
+        context.user_data[STATE_KEY] = STATE_NONE
+        await do_analysis(update, context, text)
+        return
+
+    if state == STATE_WAIT_SYMBOL_SIGNAL:
+        context.user_data[UD_SYMBOL] = text
+        context.user_data[STATE_KEY] = STATE_NONE
+        await do_signal(update, context, text)
+        return
+
+    if state == STATE_WAIT_SYMBOL_SCAN:
+        context.user_data[UD_SYMBOL] = text
+        context.user_data[STATE_KEY] = STATE_NONE
+        await do_scan(update, context, text)
+        return
+
+    if state == STATE_WAIT_CHAT:
+        # AI chat if enabled and available, else fallback response
+        if context.user_data.get(UD_AI, True):
+            client = ai_client()
+            if client is not None:
+                try:
+                    resp = client.responses.create(model=OPENAI_MODEL, input=text)  # 2
+                    out = getattr(resp, "output_text", None)
+                    if out:
+                        await update.message.reply_text(out)
+                        return
+                except Exception as e:
+                    log.warning("AI chat error: %s", e)
+
+        # fallback
+        await update.message.reply_text("أنا موجود. ابعث (📊 تحليل) أو (🎯 إشارة) أو اسألني سؤال محدد.")
+        return
+
+    # Default: helpful hint
+    await update.message.reply_text("اختار زر من القائمة 👇", reply_markup=MAIN_KB)
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Exception: %s", context.error)
+    # do not crash the bot
+
+
+# -----------------------------
 # Main
-# =========================
+# -----------------------------
 def main():
     if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(CommandHandler("settings", settings))
+    app.add_handler(CommandHandler("risk", cmd_risk))
+    app.add_handler(CommandHandler("capital", cmd_capital))
+    app.add_handler(CommandHandler("ai", cmd_ai))
+    app.add_handler(CommandHandler("auto_paper", cmd_auto_paper))
+    app.add_handler(CommandHandler("auto_live", cmd_auto_live))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # Start background auto loop
-    app.create_task(auto_loop(app))
+    app.add_error_handler(error_handler)
 
-    # IMPORTANT: avoid Conflict (only one instance) + drop pending updates
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    log.info("Bot starting...")
+    app.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
     main()
