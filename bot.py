@@ -1,8 +1,5 @@
 import os
-import asyncio
 import logging
-from datetime import datetime
-
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -18,151 +15,102 @@ from telegram.ext import (
 import ccxt
 import pandas as pd
 
-# ---------------------------
-# LOGGING
-# ---------------------------
+# ---------------- LOGGING ----------------
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger("smartbot")
 
-# ---------------------------
-# ENV
-# ---------------------------
+# ---------------- ENV ----------------
 TELEGRAM_TOKEN = (
     os.getenv("TELEGRAM_TOKEN")
     or os.getenv("TELEGRAM_BOT_TOKEN")
 )
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN missing in ENV")
+    raise RuntimeError("TELEGRAM_TOKEN missing")
 
 DEFAULT_EXCHANGE = os.getenv("DEFAULT_EXCHANGE", "bybit")
-DEFAULT_TIMEFRAME = os.getenv("DEFAULT_TIMEFRAME", "1h")
-DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "200"))
+DEFAULT_TIMEFRAME = "1h"
 
-# ---------------------------
-# EXCHANGES (PUBLIC ONLY)
-# ---------------------------
-EXCHANGES = {
-    "bybit": ccxt.bybit({"enableRateLimit": True}),
-    "okx": ccxt.okx({"enableRateLimit": True}),
-    # Binance intentionally NOT default (451 issues)
-}
+# ---------------- EXCHANGE ----------------
+exchange = ccxt.bybit({"enableRateLimit": True})
 
-# ---------------------------
-# HELPERS
-# ---------------------------
-def get_exchange(name: str):
-    if name not in EXCHANGES:
-        raise ValueError("Exchange not supported")
-    return EXCHANGES[name]
-
-def fetch_ohlcv(exchange, symbol, timeframe, limit):
-    data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+# ---------------- HELPERS ----------------
+def fetch_ohlcv(symbol):
+    data = exchange.fetch_ohlcv(symbol, timeframe=DEFAULT_TIMEFRAME, limit=200)
     df = pd.DataFrame(
-        data,
-        columns=["time", "open", "high", "low", "close", "volume"],
+        data, columns=["t", "o", "h", "l", "c", "v"]
     )
     return df
 
-def simple_signal(df: pd.DataFrame):
-    df["ma_fast"] = df["close"].rolling(9).mean()
-    df["ma_slow"] = df["close"].rolling(21).mean()
-
-    if df["ma_fast"].iloc[-1] > df["ma_slow"].iloc[-1]:
+def signal(df):
+    df["ma1"] = df["c"].rolling(9).mean()
+    df["ma2"] = df["c"].rolling(21).mean()
+    if df["ma1"].iloc[-1] > df["ma2"].iloc[-1]:
         return "BUY"
-    if df["ma_fast"].iloc[-1] < df["ma_slow"].iloc[-1]:
+    if df["ma1"].iloc[-1] < df["ma2"].iloc[-1]:
         return "SELL"
     return "WAIT"
 
-# ---------------------------
-# UI
-# ---------------------------
-def main_menu():
+# ---------------- UI ----------------
+def menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 تحليل", callback_data="analysis")],
         [InlineKeyboardButton("🎯 إشارة", callback_data="signal")],
         [InlineKeyboardButton("🤖 Auto Paper", callback_data="paper")],
         [InlineKeyboardButton("🔍 Scan", callback_data="scan")],
-        [InlineKeyboardButton("⚙️ إعدادات", callback_data="settings")],
     ])
 
-# ---------------------------
-# HANDLERS
-# ---------------------------
+# ---------------- HANDLERS ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 Smart Trading Bot جاهز للعمل\nاختر من القائمة:",
-        reply_markup=main_menu(),
+        "🚀 Smart Trading Bot شغّال\nاختار:",
+        reply_markup=menu(),
     )
 
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    q = update.callback_query
+    await q.answer()
 
-    if query.data == "analysis":
-        await query.edit_message_text(
-            "أرسل الرمز مثال:\nBTC/USDT",
+    if q.data == "analysis":
+        await q.edit_message_text("أرسل رمز مثال: BTC/USDT")
+
+    elif q.data == "signal":
+        df = fetch_ohlcv("BTC/USDT")
+        s = signal(df)
+        await q.edit_message_text(
+            f"🎯 BTC/USDT\nTF: {DEFAULT_TIMEFRAME}\nSignal: {s}"
         )
 
-    elif query.data == "signal":
-        symbol = "BTC/USDT"
-        exchange = get_exchange(DEFAULT_EXCHANGE)
-        df = fetch_ohlcv(exchange, symbol, DEFAULT_TIMEFRAME, DEFAULT_LIMIT)
-        sig = simple_signal(df)
+    elif q.data == "paper":
+        await q.edit_message_text("🤖 Auto Paper مفعل (محاكاة)")
 
-        await query.edit_message_text(
-            f"🎯 إشارة حالية\n"
-            f"Symbol: {symbol}\n"
-            f"Timeframe: {DEFAULT_TIMEFRAME}\n"
-            f"Signal: {sig}"
-        )
-
-    elif query.data == "paper":
-        await query.edit_message_text(
-            "🤖 Auto Paper\n"
-            "تم التفعيل (محاكاة بدون أموال)"
-        )
-
-    elif query.data == "scan":
-        exchange = get_exchange(DEFAULT_EXCHANGE)
-        markets = list(exchange.load_markets().keys())[:10]
-
-        results = []
-        for sym in markets:
+    elif q.data == "scan":
+        symbols = list(exchange.load_markets().keys())[:20]
+        buys = []
+        for sym in symbols:
             try:
-                df = fetch_ohlcv(exchange, sym, DEFAULT_TIMEFRAME, 100)
-                sig = simple_signal(df)
-                if sig == "BUY":
-                    results.append(sym)
-            except Exception:
-                continue
+                df = fetch_ohlcv(sym)
+                if signal(df) == "BUY":
+                    buys.append(sym)
+            except:
+                pass
 
-        text = "🔍 Scan Results:\n"
-        text += "\n".join(results) if results else "لا فرص حالياً"
-
-        await query.edit_message_text(text)
-
-    elif query.data == "settings":
-        await query.edit_message_text(
-            f"⚙️ الإعدادات الحالية:\n"
-            f"Exchange: {DEFAULT_EXCHANGE}\n"
-            f"Timeframe: {DEFAULT_TIMEFRAME}"
+        await q.edit_message_text(
+            "🔍 فرص:\n" + ("\n".join(buys) if buys else "لا فرص")
         )
 
-# ---------------------------
-# MAIN
-# ---------------------------
-async def main():
+# ---------------- START BOT ----------------
+def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(menu_handler))
 
-    logger.info("Bot started")
-    await app.run_polling()
+    logger.info("Bot running...")
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
